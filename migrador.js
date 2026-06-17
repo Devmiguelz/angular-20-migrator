@@ -1237,6 +1237,518 @@ async function runFullMigration(info) {
   print(dim('  4. Actualizar otras librerías externas (@bancolombia/*)'));
 }
 
+// ─── MIGRACIÓN MICROFRONT ────────────────────────────────────
+/**
+ * Detecta si el proyecto es un microfront (single-spa) buscando main.single-spa.ts
+ * y la dependencia single-spa-angular en package.json.
+ */
+function isMicrofrontend(projPath) {
+  const mainSpa = path.join(projPath, 'src', 'main.single-spa.ts');
+  const pkg     = path.join(projPath, 'package.json');
+  if (!fs.existsSync(mainSpa) || !fs.existsSync(pkg)) return false;
+  const content = fs.readFileSync(pkg, 'utf-8');
+  return content.includes('single-spa-angular');
+}
+
+/**
+ * Analiza el app.module.ts y extrae:
+ *  - el nombre del WidgetModule y su forRoot() con todos los parámetros
+ *  - el nombre del componente bc-* (wrapper del widget)
+ *  - la ruta principal del routing
+ *  - las rutas de los WIDGET_ROUTES exportadas
+ */
+function parseMFModule(projPath) {
+  const modulePath = path.join(projPath, 'src', 'app', 'app.module.ts');
+  const routingPath = path.join(projPath, 'src', 'app', 'app-routing.module.ts');
+
+  if (!fs.existsSync(modulePath)) return null;
+
+  const moduleContent  = fs.readFileSync(modulePath, 'utf-8');
+  const routingContent = fs.existsSync(routingPath) ? fs.readFileSync(routingPath, 'utf-8') : '';
+
+  // Detectar el widget package (@bancolombia/...-widget-web)
+  const widgetPkgMatch = moduleContent.match(/from\s*['"](@bancolombia\/[^'"]+widget-web)['"]/);
+  const widgetPkg      = widgetPkgMatch ? widgetPkgMatch[1] : null;
+
+  // Detectar el WidgetModule (nombre del import)
+  const widgetModuleMatch = moduleContent.match(/import\s*\{([^}]+)\}\s*from\s*['"]@bancolombia\/[^'"]+widget-web['"]/);
+  const widgetModuleRaw   = widgetModuleMatch ? widgetModuleMatch[1].trim() : '';
+  // Puede haber varios exports; el Module suele terminar en WidgetModule o Module
+  const widgetModuleName  = widgetModuleRaw.split(',').map(s => s.trim()).find(s => s.endsWith('Module') || s.endsWith('WidgetModule')) || widgetModuleRaw.split(',')[0].trim();
+
+  // Detectar la función importProviders o el nombre esperado (convención: importProvidersFrom<Name>Widget)
+  // Buscar el nombre del widget para construir el nombre de función
+  const importFnName = widgetModuleName
+    ? widgetModuleName.replace(/Module$/, '').replace(/Widget$/, '') + 'Widget'
+    : null;
+
+  // Detectar el bloque .forRoot({...}) — capturar todo el objeto de configuración
+  const forRootMatch = moduleContent.match(/\.forRoot\(\s*(\{[\s\S]*?\})\s*\)/);
+  const forRootConfig = forRootMatch ? forRootMatch[1] : '{}';
+
+  // Detectar componente bc-* wrapper
+  const bcComponentMatch = moduleContent.match(/import\s*\{([^}]+)\}\s*from\s*['"]\.\/(bc-[^/'"]+)\/[^'"]+['"]/);
+  const bcComponentName  = bcComponentMatch ? bcComponentMatch[1].trim() : null;
+  const bcComponentDir   = bcComponentMatch ? bcComponentMatch[2].trim() : null;
+
+  // Detectar nombre del selector del componente bc-* (en el component.ts)
+  let bcSelector = null;
+  if (bcComponentDir) {
+    const bcFiles = fs.readdirSync(path.join(projPath, 'src', 'app', bcComponentDir)).filter(f => f.endsWith('.component.ts') || f.endsWith('.ts'));
+    for (const f of bcFiles) {
+      const c = fs.readFileSync(path.join(projPath, 'src', 'app', bcComponentDir, f), 'utf-8');
+      const m = c.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+      if (m) { bcSelector = m[1]; break; }
+    }
+  }
+
+  // Detectar la ruta principal del routing (primer path no **)
+  const mainRouteMatch = routingContent.match(/path\s*:\s*['"]([^'"*]+)['"]/);
+  const mainRoute = mainRouteMatch ? mainRouteMatch[1] : 'bc-widget';
+
+  // Detectar la constante WIDGET_ROUTES importada
+  const widgetRoutesMatch = routingContent.match(/import\s*\{([^}]*ROUTES[^}]*)\}\s*from\s*['"]@bancolombia/);
+  const widgetRoutesName  = widgetRoutesMatch
+    ? widgetRoutesMatch[1].split(',').map(s => s.trim()).find(s => s.includes('ROUTES')) || null
+    : null;
+
+  // Detectar el template selector del main.single-spa.ts
+  const mainSpaContent = fs.readFileSync(path.join(projPath, 'src', 'main.single-spa.ts'), 'utf-8');
+  const templateMatch  = mainSpaContent.match(/template\s*:\s*['"]<([^>'"]+)\s*\/>['"]/);
+  const spaTemplate    = templateMatch ? templateMatch[1] : 'mf-widget';
+
+  // Detectar si hay imports adicionales en app.module (BcIllustrationModule etc.)
+  const extraModuleImports = [];
+  const extraImportRe = /import\s*\{([^}]+)\}\s*from\s*['"](@bancolombia\/design-system-web\/[^'"]+)['"]/g;
+  let em;
+  while ((em = extraImportRe.exec(moduleContent)) !== null) {
+    extraModuleImports.push({ symbols: em[1].trim(), pkg: em[2] });
+  }
+
+  return {
+    widgetPkg,
+    widgetModuleName,
+    widgetRoutesName,
+    importFnName,
+    forRootConfig,
+    bcComponentName,
+    bcComponentDir,
+    bcSelector,
+    mainRoute,
+    spaTemplate,
+    extraModuleImports,
+  };
+}
+
+/**
+ * Genera el contenido de app.ts (componente raíz standalone).
+ */
+function genAppTs(spaTemplate) {
+  return `import { Component, signal } from '@angular/core';
+import { RouterOutlet } from '@angular/router';
+
+@Component({
+  selector: '${spaTemplate}',
+  standalone: true,
+  template: \` <router-outlet></router-outlet>\`,
+  imports: [RouterOutlet],
+})
+export class App {
+  protected readonly title = signal('${spaTemplate}');
+}
+`;
+}
+
+/**
+ * Genera app.config.ts basándose en el forRoot() del módulo original.
+ * Construye la llamada importProvidersFrom<Widget>() con la misma config.
+ */
+function genAppConfig(parsed, widgetPkg) {
+  const { importFnName, widgetModuleName, forRootConfig, widgetPkg: pkg, extraModuleImports } = parsed;
+
+  // Nombre de la interface de configuración: I<Name>ConfigurationModel
+  const baseName = (importFnName || widgetModuleName || 'Widget').replace(/Widget$/, '');
+  const ifaceName = `I${baseName}ConfigurationModel`;
+  const fnName    = `importProvidersFrom${baseName}Widget`;
+
+  // Extras BDS (forRoot como provideXxx o imports adicionales)
+  const extraProviders = extraModuleImports.map(e => {
+    // Intentamos convertir BcIllustrationModule.forRoot({path:...}) a proveedor standalone
+    return `  // TODO: migrar ${e.symbols} de ${e.pkg} a proveedor standalone si aplica`;
+  }).join('\n');
+
+  return `import { APP_BASE_HREF } from '@angular/common';
+import { ApplicationConfig, provideZoneChangeDetection } from '@angular/core';
+import { provideRouter, withEnabledBlockingInitialNavigation, withHashLocation } from '@angular/router';
+import { ${fnName}, ${ifaceName} } from '${pkg || widgetPkg}';
+import { routes } from './app.routes';
+import { environment } from '../environments/environment';
+
+const WIDGET_CONFIG: ${ifaceName} = ${forRootConfig};
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    { provide: APP_BASE_HREF, useValue: '/' },
+    provideZoneChangeDetection({ eventCoalescing: true }),
+    provideRouter(routes, withHashLocation(), withEnabledBlockingInitialNavigation()),
+    ...${fnName}(WIDGET_CONFIG),
+${extraProviders ? extraProviders + '\n' : ''}  ],
+};
+`;
+}
+
+/**
+ * Genera app.routes.ts basándose en las rutas del AppRoutingModule original.
+ */
+function genAppRoutes(parsed, widgetPkg) {
+  const { bcComponentName, bcComponentDir, mainRoute, widgetRoutesName, widgetPkg: pkg } = parsed;
+
+  const routesImport = widgetRoutesName
+    ? `import { ${widgetRoutesName} } from '${pkg || widgetPkg}';`
+    : '// TODO: importar WIDGET_ROUTES desde el widget';
+
+  const childrenBlock = widgetRoutesName
+    ? `    children: ${widgetRoutesName},`
+    : `    // children: WIDGET_ROUTES,`;
+
+  const componentFile = bcComponentDir ? `./${bcComponentDir}/${bcComponentDir}` : './bc-widget/bc-widget';
+  const componentName = bcComponentName || 'BcWidgetComponent';
+
+  return `import { Routes } from '@angular/router';
+${routesImport}
+import { ${componentName} } from '${componentFile}';
+import { EmptyRouteComponent } from './empty-route/empty-route.component';
+
+export const routes: Routes = [
+  {
+    path: '${mainRoute}',
+    component: ${componentName},
+${childrenBlock}
+  },
+  {
+    path: '**',
+    component: EmptyRouteComponent,
+  },
+];
+`;
+}
+
+/**
+ * Genera main.single-spa.ts standalone.
+ */
+function genMainSingleSpa(spaTemplate) {
+  return `import { NgZone } from '@angular/core';
+import { bootstrapApplication } from '@angular/platform-browser';
+import { NavigationStart, Router } from '@angular/router';
+import { getSingleSpaExtraProviders, singleSpaAngular } from 'single-spa-angular';
+import { App } from './app/app';
+import { appConfig } from './app/app.config';
+import { singleSpaPropsSubject } from './single-spa/single-spa-props';
+
+const lifecycles = singleSpaAngular({
+  bootstrapFunction: singleSpaProps => {
+    singleSpaPropsSubject.next(singleSpaProps);
+    return bootstrapApplication(App, {
+      ...appConfig,
+      providers: [...(appConfig.providers ?? []), ...getSingleSpaExtraProviders()],
+    });
+  },
+  template: '<${spaTemplate} />',
+  Router,
+  NavigationStart,
+  NgZone,
+});
+
+export const bootstrap = lifecycles.bootstrap;
+export const mount = lifecycles.mount;
+export const unmount = lifecycles.unmount;
+`;
+}
+
+/**
+ * Genera el componente bc-* como standalone que importa el WidgetComponent.
+ */
+function genBcComponent(parsed, widgetPkg) {
+  const { bcComponentName, bcComponentDir, bcSelector, widgetPkg: pkg } = parsed;
+  // El widget standalone suele exportar un componente con el nombre base
+  // Por convención: ManageMassiveCampaignsWidget, AlertsAndNotificationsLogWidget, etc.
+  const widgetComponentName = (pkg || widgetPkg || '')
+    .split('/').pop()                          // alerts-and-notifications-log-widget-web
+    .replace(/-web$/, '')                      // alerts-and-notifications-log-widget
+    .split('-').map(w => w[0].toUpperCase() + w.slice(1)).join(''); // AlertsAndNotificationsLogWidget
+
+  const templateFile = bcComponentDir
+    ? `./${bcComponentDir.split('/').pop()}.html`
+    : './bc-widget.html';
+
+  const selector = bcSelector || 'bc-widget';
+
+  return `import { Component } from '@angular/core';
+import { ${widgetComponentName} } from '${pkg || widgetPkg}';
+
+@Component({
+  selector: '${selector}',
+  standalone: true,
+  imports: [${widgetComponentName}],
+  templateUrl: '${templateFile}',
+})
+export class ${bcComponentName || 'BcWidgetComponent'} {}
+`;
+}
+
+/**
+ * Actualiza tsconfig.json al patrón Angular 20:
+ * - moduleResolution: bundler
+ * - esModuleInterop: true
+ * - quita noImplicitOverride, noPropertyAccessFromIndexSignature, downlevelIteration, importHelpers
+ * - agrega referencias a tsconfig.app.json y tsconfig.spec.json
+ * - actualiza lib a es2018
+ * - agrega typeCheckHostBindings en angularCompilerOptions
+ */
+function updateTsconfig(projPath) {
+  const tsPath = path.join(projPath, 'tsconfig.json');
+  if (!fs.existsSync(tsPath)) return false;
+
+  const ts = JSON.parse(fs.readFileSync(tsPath, 'utf-8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, ''));
+
+  // CompilerOptions
+  const co = ts.compilerOptions || {};
+  co.moduleResolution = 'bundler';
+  co.esModuleInterop  = true;
+  co.lib              = ['es2018', 'dom'];
+  delete co.noImplicitOverride;
+  delete co.noPropertyAccessFromIndexSignature;
+  delete co.downlevelIteration;
+  delete co.importHelpers;
+  delete co.strict; // Angular 20 lo maneja por tsconfig.app.json
+
+  ts.compilerOptions = co;
+
+  // AngularCompilerOptions
+  ts.angularCompilerOptions = ts.angularCompilerOptions || {};
+  ts.angularCompilerOptions.typeCheckHostBindings = true;
+
+  // References
+  ts.files = [];
+  ts.references = [
+    { path: './tsconfig.app.json' },
+    { path: './tsconfig.spec.json' },
+  ];
+
+  fs.writeFileSync(tsPath, JSON.stringify(ts, null, 2) + '\n', 'utf-8');
+  return true;
+}
+
+/**
+ * Actualiza jest.config.js añadiendo testEnvironment: "jsdom".
+ */
+function updateJestConfig(projPath) {
+  const jestPath = path.join(projPath, 'jest.config.js');
+  if (!fs.existsSync(jestPath)) return false;
+  let content = fs.readFileSync(jestPath, 'utf-8');
+  if (content.includes('testEnvironment')) return true; // ya tiene
+  content = content.replace(
+    /clearMocks\s*:\s*true,/,
+    'clearMocks: true,\n  testEnvironment: "jsdom",'
+  );
+  fs.writeFileSync(jestPath, content, 'utf-8');
+  return true;
+}
+
+/**
+ * Actualiza las dependencias MF en package.json a las versiones de Angular 20.
+ */
+function updateMFDependencies(projPath) {
+  const pkgPath = path.join(projPath, 'package.json');
+  const pkg     = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+
+  const UPDATES = {
+    'single-spa-angular':              '9.2.0',
+    '@angular-builders/custom-webpack': '20.0.0',
+    'zone.js':                         '0.16.1',
+    'jest-preset-angular':             '16.1.2',
+  };
+
+  let changed = false;
+  for (const [dep, ver] of Object.entries(UPDATES)) {
+    if (pkg.dependencies && pkg.dependencies[dep] !== undefined) {
+      pkg.dependencies[dep] = ver; changed = true;
+    }
+    if (pkg.devDependencies && pkg.devDependencies[dep] !== undefined) {
+      pkg.devDependencies[dep] = ver; changed = true;
+    }
+  }
+
+  // Eliminar core-utils del package.json (no se usa en el MF)
+  if (pkg.dependencies?.['@bancolombia/core-utils-widgets-web']) {
+    delete pkg.dependencies['@bancolombia/core-utils-widgets-web'];
+    changed = true;
+  }
+  if (pkg.devDependencies?.['@bancolombia/core-utils-widgets-web']) {
+    delete pkg.devDependencies['@bancolombia/core-utils-widgets-web'];
+    changed = true;
+  }
+
+  if (changed) {
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
+  }
+  return changed;
+}
+
+async function migrateMicrofrontend() {
+  print(title('MIGRACIÓN MICROFRONT (single-spa → Angular 20 standalone)'));
+
+  // Verificar que es un MF
+  if (!isMicrofrontend(projectPath)) {
+    print(err('Este proyecto no parece ser un microfront (no se encontró src/main.single-spa.ts o single-spa-angular en package.json).'));
+    return;
+  }
+
+  // Verificar que usa NgModule (si ya está migrado, no hacer nada)
+  const mainSpaContent = fs.readFileSync(path.join(projectPath, 'src', 'main.single-spa.ts'), 'utf-8');
+  if (mainSpaContent.includes('bootstrapApplication')) {
+    print(ok('main.single-spa.ts ya usa bootstrapApplication — el MF parece estar migrado a standalone.'));
+    return;
+  }
+
+  print(info('Microfront detectado con NgModule. Se migrará a standalone.\n'));
+
+  // Parsear el módulo actual
+  const parsed = parseMFModule(projectPath);
+  if (!parsed) {
+    print(err('No se encontró app.module.ts. ¿El MF ya fue migrado manualmente?'));
+    return;
+  }
+
+  print(info(`Widget detectado : ${parsed.widgetPkg || 'desconocido'}`));
+  print(info(`Módulo actual    : ${parsed.widgetModuleName || 'desconocido'}`));
+  print(info(`Componente bc-*  : ${parsed.bcComponentName || 'desconocido'} (${parsed.bcComponentDir})`));
+  print(info(`Ruta principal   : ${parsed.mainRoute}`));
+  print(info(`Template SPA     : <${parsed.spaTemplate} />`));
+  if (parsed.widgetRoutesName) print(info(`Widget routes    : ${parsed.widgetRoutesName}`));
+  if (parsed.extraModuleImports.length) {
+    print(warn(`Imports adicionales detectados (revisión manual):`));
+    parsed.extraModuleImports.forEach(e => print(dim(`  · ${e.symbols} from ${e.pkg}`)));
+  }
+
+  print('');
+  print(`${C.bold}  Pasos que se ejecutarán:${C.reset}`);
+  print(`  ${C.cyan}1${C.reset}  Migrar Angular ${parsed.angularVer || '?'} → 20 (ng update paso a paso)`);
+  print(`  ${C.cyan}2${C.reset}  Generar app.ts, app.config.ts, app.routes.ts`);
+  print(`  ${C.cyan}3${C.reset}  Actualizar main.single-spa.ts a bootstrapApplication`);
+  print(`  ${C.cyan}4${C.reset}  Convertir componente bc-* a standalone`);
+  print(`  ${C.cyan}5${C.reset}  Eliminar app.module.ts y app-routing.module.ts`);
+  print(`  ${C.cyan}6${C.reset}  Actualizar tsconfig.json`);
+  print(`  ${C.cyan}7${C.reset}  Actualizar jest.config.js`);
+  print(`  ${C.cyan}8${C.reset}  Actualizar dependencias (single-spa-angular, custom-webpack, zone.js, jest-preset-angular)`);
+  print(`  ${C.cyan}9${C.reset}  Eliminar core-utils-widgets-web de package.json`);
+  print('');
+
+  const runAngularUpdate = await prompt('  ¿Ejecutar migración Angular primero (ng update 16→20)? (s/n): ');
+  const doAngularUpdate  = runAngularUpdate.toLowerCase() === 's';
+
+  const confirm = await prompt('  ¿Confirmar transformación del MF? (s/n): ');
+  if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+
+  // ── Paso 1: migración Angular (opcional, usa la función existente) ──
+  if (doAngularUpdate) {
+    const pkgInfo = detectProject(projectPath);
+    await migrateAngular(pkgInfo);
+  }
+
+  // ── Paso 2: Generar nuevos archivos ──
+  print(step('Generando archivos standalone...'));
+
+  const appDir = path.join(projectPath, 'src', 'app');
+
+  // app.ts
+  const appTsContent = genAppTs(parsed.spaTemplate);
+  fs.writeFileSync(path.join(appDir, 'app.ts'), appTsContent, 'utf-8');
+  print(ok('src/app/app.ts'));
+
+  // app.config.ts
+  const appConfigContent = genAppConfig(parsed, parsed.widgetPkg);
+  fs.writeFileSync(path.join(appDir, 'app.config.ts'), appConfigContent, 'utf-8');
+  print(ok('src/app/app.config.ts'));
+
+  // app.routes.ts
+  const appRoutesContent = genAppRoutes(parsed, parsed.widgetPkg);
+  fs.writeFileSync(path.join(appDir, 'app.routes.ts'), appRoutesContent, 'utf-8');
+  print(ok('src/app/app.routes.ts'));
+
+  // ── Paso 3: Actualizar main.single-spa.ts ──
+  print(step('Actualizando main.single-spa.ts...'));
+  const newMainSpa = genMainSingleSpa(parsed.spaTemplate);
+  fs.writeFileSync(path.join(projectPath, 'src', 'main.single-spa.ts'), newMainSpa, 'utf-8');
+  print(ok('src/main.single-spa.ts'));
+
+  // ── Paso 4: Convertir componente bc-* a standalone ──
+  if (parsed.bcComponentDir) {
+    print(step(`Actualizando componente ${parsed.bcComponentDir}...`));
+    const bcDir     = path.join(appDir, parsed.bcComponentDir);
+    const bcFiles   = fs.existsSync(bcDir) ? fs.readdirSync(bcDir) : [];
+    const bcTsFile  = bcFiles.find(f => f.endsWith('.component.ts') || (f.endsWith('.ts') && !f.endsWith('.spec.ts')));
+
+    if (bcTsFile) {
+      const newBcContent = genBcComponent(parsed, parsed.widgetPkg);
+      fs.writeFileSync(path.join(bcDir, bcTsFile), newBcContent, 'utf-8');
+      print(ok(`src/app/${parsed.bcComponentDir}/${bcTsFile}`));
+    } else {
+      print(warn(`No se encontró archivo .ts en ${parsed.bcComponentDir} — actualiza manualmente`));
+    }
+  }
+
+  // ── Paso 5: Eliminar app.module.ts y app-routing.module.ts ──
+  print(step('Eliminando archivos NgModule...'));
+  const filesToDelete = [
+    path.join(appDir, 'app.module.ts'),
+    path.join(appDir, 'app-routing.module.ts'),
+  ];
+  for (const f of filesToDelete) {
+    if (fs.existsSync(f)) {
+      fs.unlinkSync(f);
+      print(ok(`Eliminado: ${path.relative(projectPath, f)}`));
+    }
+  }
+
+  // ── Paso 6: Actualizar tsconfig.json ──
+  print(step('Actualizando tsconfig.json...'));
+  if (updateTsconfig(projectPath)) {
+    print(ok('tsconfig.json actualizado'));
+  } else {
+    print(warn('tsconfig.json no encontrado'));
+  }
+
+  // ── Paso 7: Actualizar jest.config.js ──
+  print(step('Actualizando jest.config.js...'));
+  if (updateJestConfig(projectPath)) {
+    print(ok('jest.config.js actualizado'));
+  } else {
+    print(warn('jest.config.js no encontrado'));
+  }
+
+  // ── Paso 8 y 9: Actualizar dependencias y eliminar core-utils ──
+  print(step('Actualizando package.json (dependencias MF + eliminar core-utils)...'));
+  if (updateMFDependencies(projectPath)) {
+    print(ok('package.json actualizado'));
+    print(info('Ejecuta: npm install --legacy-peer-deps  para sincronizar node_modules'));
+  }
+
+  separator();
+  print(ok('Transformación del MF completada 🚀\n'));
+  print(`${C.bold}Revisión manual necesaria:${C.reset}`);
+  print(dim('  1. Verifica app.config.ts — el objeto WIDGET_CONFIG puede necesitar ajuste de tipos'));
+  print(dim(`  2. Verifica el nombre del componente standalone exportado por el widget`));
+  print(dim(`     (debe coincidir con el import en el bc-*.ts generado)`));
+  if (parsed.extraModuleImports.length) {
+    print(dim('  3. Migra los imports adicionales del módulo (BcIllustrationModule, etc.)'));
+    parsed.extraModuleImports.forEach(e => print(dim(`     · ${e.symbols} desde ${e.pkg}`)));
+  }
+  print(dim('  4. Ejecuta: npm run build'));
+  print(dim('  5. Ejecuta: npm test'));
+  print(dim('  6. Revisa polyfills.ts (zone.js actualizado a 0.16.1)'));
+}
+
 // ─── MENÚ PRINCIPAL ─────────────────────────────────────────
 async function showMenu(info) {
   const angVer = info.angularVer || '?';
@@ -1255,6 +1767,7 @@ async function showMenu(info) {
   print(`  ${C.cyan}7${C.reset}  Cambiar proyecto`);
   print(`  ${C.cyan}8${C.reset}  Eliminar @bancolombia/core-utils-widgets-web`);
   print(`  ${C.cyan}9${C.reset}  Reestructura de carpetas (patrón registered-accounts)`);
+  print(`  ${C.cyan}10${C.reset} Migrar Microfront (NgModule → standalone + Angular 20)`);
   print(`  ${C.red}0${C.reset}  Salir\n`);
 
   const choice = await prompt(`  → `);
@@ -1306,6 +1819,7 @@ async function main() {
         case '6': await runFullMigration(detected); break;
         case '8': await removeCoreUtils(); break;
         case '9': await restructureFolders(); break;
+        case '10': await migrateMicrofrontend(); break;
         case '7':
           const logFile = saveLog();
           print(ok(`Log guardado en: ${logFile}`));
@@ -1316,7 +1830,7 @@ async function main() {
           print('\nHasta pronto 👋\n');
           process.exit(0);
         default:
-          print(warn('Opción inválida. Elige entre 0 y 9.'));
+          print(warn('Opción inválida. Elige entre 0 y 10.'));
       }
 
       await prompt('\n  Presiona Enter para volver al menú...');
