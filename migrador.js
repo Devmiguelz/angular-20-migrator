@@ -652,26 +652,59 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       : newInternalLines + '\n' + result;
   }
 
-  // ── 9. Actualizar bloque imports: [...] ───────────────────────────────
-  result = result.replace(/imports\s*:\s*\[([^\]]*)\]/s, (_, inner) => {
-    let cleaned = inner;
-    for (const modName of legacyModulesFound) {
-      cleaned = cleaned.replace(
-        new RegExp('\\b' + modName + '\\s*\\.forRoot\\s*\\((?:[^)(]|\\([^)]*\\))*\\)\\s*,?\\s*', 'gs'), ''
+  // ── 9. Actualizar o crear bloque imports: [...] ───────────────────────
+  const allBdsNew      = [...new Set([...bdsToAdd.values()].flatMap(s => [...s]))];
+  const allInternalNew = internalToAdd.map(e => e.className);
+
+  const hasImportsBlock = /imports\s*:\s*\[/s.test(result);
+
+  if (hasImportsBlock) {
+    // El bloque existe: limpiar módulos legacy y agregar los nuevos
+    result = result.replace(/imports\s*:\s*\[([^\]]*)\]/s, (_, inner) => {
+      let cleaned = inner;
+      for (const modName of legacyModulesFound) {
+        cleaned = cleaned.replace(
+          new RegExp('\\b' + modName + '\\s*\\.forRoot\\s*\\((?:[^)(]|\\([^)]*\\))*\\)\\s*,?\\s*', 'gs'), ''
+        );
+        cleaned = cleaned.replace(new RegExp('\\b' + modName + '\\b,?\\s*', 'g'), '');
+      }
+      const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
+        s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
       );
-      cleaned = cleaned.replace(new RegExp('\\b' + modName + '\\b,?\\s*', 'g'), '');
+      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
+      const fmt = combined.length > 3
+        ? '\n        ' + combined.join(',\n        ') + ',\n    '
+        : combined.join(', ');
+      return 'imports: [' + fmt + ']';
+    });
+  } else {
+    // El bloque NO existe (componente sin standalone aún o NgModule sin imports[])
+    // Insertar imports: [...] dentro del @Component({...}) antes del cierre })
+    // Buscar el @Component decorator y agregar imports antes del cierre
+    const combined = [...new Set([...allBdsNew, ...allInternalNew])].filter(Boolean);
+    if (combined.length > 0) {
+      const fmt = combined.length > 3
+        ? '\n        ' + combined.join(',\n        ') + ',\n    '
+        : combined.join(', ');
+      const importsLine = '    imports: [' + fmt + '],';
+      // Insertar antes del cierre del @Component({ ... })
+      // Buscar el patrón @Component({...}) y añadir imports antes del último })
+      result = result.replace(
+        /(@Component\s*\(\s*\{)([\s\S]*?)(\}\s*\))/,
+        (match, open, body, close) => {
+          // Si ya hay standalone: true, insertar imports después de él
+          if (/standalone\s*:\s*true/.test(body)) {
+            return open + body.replace(
+              /(standalone\s*:\s*true,?)/,
+              '$1\n' + importsLine
+            ) + close;
+          }
+          // Si no, insertar al final del body
+          return open + body.trimEnd() + '\n' + importsLine + '\n' + close;
+        }
+      );
     }
-    const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
-      s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
-    );
-    const allBdsNew      = [...new Set([...bdsToAdd.values()].flatMap(s => [...s]))];
-    const allInternalNew = internalToAdd.map(e => e.className);
-    const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
-    const fmt = combined.length > 3
-      ? '\n        ' + combined.join(',\n        ') + ',\n    '
-      : combined.join(', ');
-    return 'imports: [' + fmt + ']';
-  });
+  }
 
   result = result.replace(/\n{3,}/g, '\n\n');
 
