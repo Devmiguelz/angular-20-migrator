@@ -588,14 +588,60 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     }
   }
 
-  // ── 3. Filtrar los que ya están importados en el TS ───────────────────
+  // ── 3. Extraer lo que YA está en imports: [...] del @Component ─────────
+  // Importante: chequeamos el bloque imports:[] del decorador, NO todo el TS
+  // (un símbolo puede estar en el import statement pero NO en imports:[])
+  const existingInImportsBlock = new Set();
+  const importsBlockMatch = ts.match(/imports\s*:\s*\[([^\]]*)\]/s);
+  if (importsBlockMatch) {
+    importsBlockMatch[1].split(',').map(s => s.trim()).filter(Boolean)
+      .forEach(s => existingInImportsBlock.add(s));
+  }
+
+  // ── 4. Determinar qué BDS standalones hay que agregar ─────────────────
+  // También detectar los que están en import{} statements del TS pero NO en imports:[]
   const bdsToAdd = new Map();
   for (const [pkg, standalones] of bdsNeeded) {
-    const missing = [...standalones].filter(s => !new RegExp('\\b' + s + '\\b').test(ts));
+    const missing = [...standalones].filter(s => !existingInImportsBlock.has(s));
     if (missing.length > 0) bdsToAdd.set(pkg, new Set(missing));
   }
 
-  // ── 4. Detectar componentes internos desde HTML ───────────────────────
+  // ── 5. Detectar símbolos Angular que están en TS pero faltan en imports:[] ─
+  // CommonModule, FormsModule, ReactiveFormsModule, RouterLink, RouterModule, etc.
+  const ANGULAR_MODULE_MAP = {
+    'CommonModule':         { pkg: '@angular/common',      symbol: 'CommonModule' },
+    'FormsModule':          { pkg: '@angular/forms',       symbol: 'FormsModule' },
+    'ReactiveFormsModule':  { pkg: '@angular/forms',       symbol: 'ReactiveFormsModule' },
+    'RouterModule':         { pkg: '@angular/router',      symbol: 'RouterModule' },
+    'RouterLink':           { pkg: '@angular/router',      symbol: 'RouterLink' },
+    'RouterOutlet':         { pkg: '@angular/router',      symbol: 'RouterOutlet' },
+    'AsyncPipe':            { pkg: '@angular/common',      symbol: 'AsyncPipe' },
+    'NgIf':                 { pkg: '@angular/common',      symbol: 'NgIf' },
+    'NgFor':                { pkg: '@angular/common',      symbol: 'NgFor' },
+    'NgClass':              { pkg: '@angular/common',      symbol: 'NgClass' },
+    'NgStyle':              { pkg: '@angular/common',      symbol: 'NgStyle' },
+    'NgSwitch':             { pkg: '@angular/common',      symbol: 'NgSwitch' },
+    'NgSwitchCase':         { pkg: '@angular/common',      symbol: 'NgSwitchCase' },
+    'NgSwitchDefault':      { pkg: '@angular/common',      symbol: 'NgSwitchDefault' },
+    'DatePipe':             { pkg: '@angular/common',      symbol: 'DatePipe' },
+    'DecimalPipe':          { pkg: '@angular/common',      symbol: 'DecimalPipe' },
+    'CurrencyPipe':         { pkg: '@angular/common',      symbol: 'CurrencyPipe' },
+    'UpperCasePipe':        { pkg: '@angular/common',      symbol: 'UpperCasePipe' },
+    'LowerCasePipe':        { pkg: '@angular/common',      symbol: 'LowerCasePipe' },
+    'JsonPipe':             { pkg: '@angular/common',      symbol: 'JsonPipe' },
+    'SlicePipe':            { pkg: '@angular/common',      symbol: 'SlicePipe' },
+    'PercentPipe':          { pkg: '@angular/common',      symbol: 'PercentPipe' },
+  };
+  const angularToAdd = []; // { symbol }
+  for (const [symbol, info] of Object.entries(ANGULAR_MODULE_MAP)) {
+    // Está en el import statement del TS pero NO en imports:[]
+    const inImportStatement = new RegExp("import\\s*\\{[^}]*\\b" + symbol + "\\b[^}]*\\}\\s*from\\s*['\"']" + info.pkg.replace(/\//g,'\\/') + "['\"']").test(ts);
+    if (inImportStatement && !existingInImportsBlock.has(symbol)) {
+      angularToAdd.push(symbol);
+    }
+  }
+
+  // ── 6. Detectar componentes internos desde HTML ───────────────────────
   const internalToAdd = [];
 
   if (html && Object.keys(projectSelectorIndex).length > 0) {
@@ -609,7 +655,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       seenSelectors.add(tag);
       const entry = projectSelectorIndex[tag];
       if (!entry) continue;
-      if (new RegExp('\\b' + entry.className + '\\b').test(ts)) continue;
+      if (existingInImportsBlock.has(entry.className)) continue;
       const rel = path.relative(path.dirname(filePath), entry.filePath)
         .replace(/\.ts$/, '').replace(/\\/g, '/');
       const relPath = rel.startsWith('.') ? rel : './' + rel;
@@ -618,7 +664,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
   }
 
   // ── 5. Nada que hacer ────────────────────────────────────────────────
-  if (legacyModulesFound.size === 0 && bdsToAdd.size === 0 && internalToAdd.length === 0) return null;
+  if (legacyModulesFound.size === 0 && bdsToAdd.size === 0 && internalToAdd.length === 0 && angularToAdd.length === 0) return null;
 
   let result = ts;
 
@@ -670,7 +716,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
         s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
       );
-      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
+      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew, ...angularToAdd])].filter(Boolean);
       const fmt = combined.length > 3
         ? '\n        ' + combined.join(',\n        ') + ',\n    '
         : combined.join(', ');
@@ -678,7 +724,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     });
   } else {
     // NO existe imports: [] — crearlo dentro del @Component({})
-    const combined = [...new Set([...allBdsNew, ...allInternalNew])].filter(Boolean);
+    const combined = [...new Set([...allBdsNew, ...allInternalNew, ...angularToAdd])].filter(Boolean);
     if (combined.length > 0) {
       const fmt = combined.length > 3
         ? '\n        ' + combined.join(',\n        ') + ',\n    '
@@ -707,6 +753,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     legacyModules: [...legacyModulesFound],
     bdsAdded: [...bdsToAdd.entries()].map(([pkg, s]) => [...s].join(', ') + ' (' + pkg + ')'),
     internalAdded: internalToAdd.map(e => e.className + ' \u2190 ' + e.selector),
+    angularAdded: angularToAdd,
   };
 }
 
@@ -734,9 +781,10 @@ async function migrateBDS(projectInfo) {
     const htmlFile = path.join(dir, base + '.html');
     const r = migrateTsFile(tsFile, fs.existsSync(htmlFile) ? htmlFile : null, projectSelectorIndex);
     if (!r) continue;
-    if (r.legacyModules.length > 0)   filesWithLegacy++;
-    if (r.bdsAdded.length > 0)        filesWithMissingBds++;
-    if (r.internalAdded.length > 0)   filesWithMissingInternal++;
+    if (r.legacyModules.length > 0)                    filesWithLegacy++;
+    if (r.bdsAdded.length > 0)                         filesWithMissingBds++;
+    if (r.internalAdded.length > 0)                    filesWithMissingInternal++;
+    if (r.angularAdded && r.angularAdded.length > 0)   filesWithMissingInternal++;
   }
 
   if (filesWithLegacy === 0 && filesWithMissingBds === 0 && filesWithMissingInternal === 0) {
@@ -775,6 +823,7 @@ async function migrateBDS(projectInfo) {
     if (migResult.legacyModules.length)  migResult.legacyModules.forEach(m => print('    ' + dim('✖ módulo legacy eliminado: ' + m)));
     if (migResult.bdsAdded.length)       migResult.bdsAdded.forEach(s  => print('    ' + ok('BDS standalone agregado: ' + s)));
     if (migResult.internalAdded.length)  migResult.internalAdded.forEach(s => print('    ' + ok('Componente interno agregado: ' + s)));
+    if (migResult.angularAdded && migResult.angularAdded.length) migResult.angularAdded.forEach(s => print('    ' + ok('Angular agregado a imports[]: ' + s)));
 
     if (!isDry) {
       fs.writeFileSync(tsFile, migResult.result, 'utf-8');
@@ -811,7 +860,7 @@ async function convertStandaloneFlag() {
 
   for (const f of tsFiles) {
     const content = fs.readFileSync(f, 'utf-8');
-    if (!/\@Component\s*\(/.test(content)) continue;
+    if (!/\@Component\s*\(|\@Pipe\s*\(|\@Directive\s*\(/.test(content)) continue;
     if (/standalone\s*:\s*false/.test(content)) withFalse.push(f);
     else if (!/standalone\s*:\s*true/.test(content)) withoutFlag.push(f);
   }
