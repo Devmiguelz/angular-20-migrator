@@ -29,6 +29,7 @@ Ingresa el path completo del proyecto cuando lo pida (soporta `~`):
 8   Eliminar @bancolombia/core-utils-widgets-web
 9   Reestructura de carpetas (patrón registered-accounts)
 10  Migrar Microfront (NgModule → standalone + Angular 20)
+11  Convertir standalone: false → standalone: true
 0   Salir
 ```
 
@@ -160,6 +161,25 @@ Migra un microfront single-spa de la arquitectura NgModule (Angular 16) a standa
 - Migrar módulos adicionales como `BcIllustrationModule.forRoot()` (marcados con `// TODO` en el archivo generado)
 - Ejecutar `npm install --legacy-peer-deps` tras la actualización de dependencias
 - Ejecutar `npm run build` y `npm test`
+
+### 11 — Convertir standalone: false → standalone: true
+
+Cuando `ng generate @angular/core:standalone` no logra convertir los componentes completamente (los deja con `standalone: false` en vez de `standalone: true`), esta opción lo hace directamente en el código:
+
+- **`standalone: false` → `standalone: true`** — reemplaza en todos los `.ts` del proyecto
+- **Sin propiedad standalone** — la agrega justo después del `selector:` en el `@Component`
+- Omite `.spec.ts` y `.module.ts` (no son componentes)
+- Dry-run disponible para previsualizar sin guardar
+- **No hace commit**
+
+**Orden recomendado cuando `ng generate` falla:**
+
+1. Opción `2` — Migrar Angular 16 → 20
+2. Opción `11` — Convertir `standalone: false` → `standalone: true`
+3. Opción `3` — Migrar BDS (rellena `imports: []` con BDS y componentes internos)
+4. Opción `8` — Eliminar core-utils
+5. Opción `5` — Control Flow
+6. Opción `9` — Reestructura de carpetas
 
 ---
 

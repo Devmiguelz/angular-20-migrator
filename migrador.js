@@ -764,6 +764,81 @@ async function migrateBDS(projectInfo) {
 
 
 
+// ─── CONVERTIR standalone: false → standalone: true ────────────
+async function convertStandaloneFlag() {
+  print(title('CONVERTIR standalone: false → standalone: true'));
+  print(info('Reemplaza standalone: false por standalone: true en todos los componentes,'));
+  print(info('y agrega standalone: true donde no existe el decorador todavía.\n'));
+
+  const srcRoots = [
+    path.join(projectPath, 'src'),
+    path.join(projectPath, 'projects'),
+  ].filter(d => fs.existsSync(d));
+
+  const tsFiles = srcRoots.flatMap(r => getAllFiles(r, '.ts'))
+    .filter(f => !f.endsWith('.spec.ts') && !f.endsWith('.module.ts'));
+
+  // Pre-análisis
+  const withFalse    = [];
+  const withoutFlag  = [];
+
+  for (const f of tsFiles) {
+    const content = fs.readFileSync(f, 'utf-8');
+    if (!/\@Component\s*\(/.test(content)) continue;
+    if (/standalone\s*:\s*false/.test(content)) withFalse.push(f);
+    else if (!/standalone\s*:\s*true/.test(content)) withoutFlag.push(f);
+  }
+
+  if (withFalse.length === 0 && withoutFlag.length === 0) {
+    print(ok('Todos los componentes ya tienen standalone: true. Nada que hacer.'));
+    return;
+  }
+
+  print(warn(`  Con standalone: false (a cambiar)     : ${withFalse.length} archivo(s)`));
+  print(warn(`  Sin propiedad standalone (a agregar)  : ${withoutFlag.length} archivo(s)\n`));
+
+  const dryRun = await prompt('  ¿Ejecutar en modo dry-run (solo muestra sin guardar)? (s/n): ');
+  const isDry  = dryRun.toLowerCase() === 's';
+
+  const confirm = await prompt(`  ¿${isDry ? 'Analizar' : 'Aplicar'} cambios? (s/n): `);
+  if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+
+  let changed = 0;
+
+  // 1. Cambiar standalone: false → standalone: true
+  for (const f of withFalse) {
+    const original = fs.readFileSync(f, 'utf-8');
+    const result   = original.replace(/\bstandalone\s*:\s*false\b/g, 'standalone: true');
+    const rel      = path.relative(projectPath, f);
+    print(`  ${C.green}✔${C.reset}  standalone: false → true   ${C.dim}${rel}${C.reset}`);
+    if (!isDry) { fs.writeFileSync(f, result, 'utf-8'); }
+    changed++;
+  }
+
+  // 2. Agregar standalone: true donde @Component no lo tiene
+  for (const f of withoutFlag) {
+    const original = fs.readFileSync(f, 'utf-8');
+    // Insertar standalone: true justo después de la primera propiedad del @Component
+    // Busca selector: '...' o templateUrl: '...' y agrega standalone: true después
+    const result = original.replace(
+      /(@Component\s*\(\s*\{)([\s\S]*?)(selector\s*:\s*['"][^'"]+['"])/,
+      (_, open, before, selectorLine) =>
+        `${open}${before}${selectorLine},\n    standalone: true`
+    );
+    if (result === original) continue; // no se pudo insertar
+    const rel = path.relative(projectPath, f);
+    print(`  ${C.green}✔${C.reset}  standalone: true agregado   ${C.dim}${rel}${C.reset}`);
+    if (!isDry) { fs.writeFileSync(f, result, 'utf-8'); }
+    changed++;
+  }
+
+  separator();
+  print(ok(`${changed} archivos ${isDry ? 'analizados' : 'actualizados'}.`));
+  if (!isDry) {
+    print(info('Siguiente paso recomendado: ejecuta la opción 3 (Migrar BDS) para rellenar los imports: []'));
+  }
+}
+
 // ─── STANDALONE MIGRATION ───────────────────────────────────
 async function migrateStandalone() {
   print(title('MIGRACIÓN A STANDALONE'));
@@ -2006,6 +2081,7 @@ async function showMenu(projectInfo) {
   print(`  ${C.cyan}8${C.reset}  Eliminar @bancolombia/core-utils-widgets-web`);
   print(`  ${C.cyan}9${C.reset}  Reestructura de carpetas (patrón registered-accounts)`);
   print(`  ${C.cyan}10${C.reset} Migrar Microfront (NgModule → standalone + Angular 20)`);
+  print(`  ${C.cyan}11${C.reset} Convertir standalone: false → standalone: true`);
   print(`  ${C.red}0${C.reset}  Salir\n`);
 
   const choice = await prompt(`  → `);
@@ -2058,6 +2134,7 @@ async function main() {
         case '8': await removeCoreUtils(); break;
         case '9': await restructureFolders(); break;
         case '10': await migrateMicrofrontend(); break;
+        case '11': await convertStandaloneFlag(); break;
         case '7':
           const logFile = saveLog();
           print(ok(`Log guardado en: ${logFile}`));
@@ -2068,7 +2145,7 @@ async function main() {
           print('\nHasta pronto 👋\n');
           process.exit(0);
         default:
-          print(warn('Opción inválida. Elige entre 0 y 10.'));
+          print(warn('Opción inválida. Elige entre 0 y 11.'));
       }
 
       await prompt('\n  Presiona Enter para volver al menú...');
