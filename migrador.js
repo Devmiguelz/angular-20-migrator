@@ -401,99 +401,334 @@ async function migrateAngular(projectInfo) {
 }
 
 // ─── MIGRACIÓN BDS ──────────────────────────────────────────
-function migrateTsFile(filePath, htmlPath) {
+/**
+ * BDS_MAP extendido — cubre módulos adicionales encontrados en los proyectos reales.
+ * Incluye tanto los Módulos legacy (BcXxxModule) como sus equivalentes standalone.
+ * También mapea componentes standalone que ya se importan directamente (para detectar
+ * faltantes desde HTML).
+ */
+const BDS_STANDALONE_MAP = {
+  // Tag HTML → { pkg, standalones[] }
+  // Generado desde BDS_MAP + HTML_TAG_MAP + casos reales del proyecto
+  'bc-circle-loading':     { pkg: 'bc-circle-loading',  standalones: ['BcCircleLoadingComponent'] },
+  'bc-search':             { pkg: 'bc-search',           standalones: ['BcSearchComponent','BcSearchLeftComponent','BcSearchAdvancedComponent','BcSearchAdvancedItemComponent','BcSearchResultFilterComponent','BcSearchButtonComponent','BcSearchContentItemsComponent'] },
+  'bc-search-left':        { pkg: 'bc-search',           standalones: ['BcSearchComponent','BcSearchLeftComponent'] },
+  'bc-search-advanced':    { pkg: 'bc-search',           standalones: ['BcSearchAdvancedComponent','BcSearchAdvancedItemComponent'] },
+  'bc-form-field':         { pkg: 'bc-input',            standalones: ['BcFormFieldComponent','BcInputDirective'] },
+  'bc-button':             { pkg: 'bc-button',           standalones: ['BcButtonDirective'] },
+  'bc-table-container':    { pkg: 'bc-table',            standalones: ['BcTableDirective','BcCellDirective','BcTableContainerComponent','BcTableContentComponent','BcTableHeaderComponent','BcTableFooterComponent','BcTableDropdownComponent'] },
+  'bc-table-content':      { pkg: 'bc-table',            standalones: ['BcTableDirective','BcCellDirective','BcTableContainerComponent','BcTableContentComponent','BcTableHeaderComponent','BcTableFooterComponent','BcTableDropdownComponent'] },
+  'bc-table-header':       { pkg: 'bc-table',            standalones: ['BcTableDirective','BcCellDirective','BcTableContainerComponent','BcTableContentComponent','BcTableHeaderComponent','BcTableFooterComponent','BcTableDropdownComponent'] },
+  'bc-table-footer':       { pkg: 'bc-table',            standalones: ['BcTableDirective','BcTableFooterComponent'] },
+  'bc-table-dropdown':     { pkg: 'bc-table',            standalones: ['BcTableDropdownComponent'] },
+  'bc-paginator-v2':       { pkg: 'bc-paginator-v2',     standalones: ['BcPaginatorV2Component'] },
+  'bc-paginator':          { pkg: 'bc-paginator',        standalones: ['BcPaginatorComponent'] },
+  'bc-icon':               { pkg: 'bc-icon',             standalones: ['BcIconComponent'] },
+  'bc-modal':              { pkg: 'bc-modal',            standalones: ['BcModalComponent'] },
+  'bc-breadcrumb':         { pkg: 'bc-breadcrumb',       standalones: ['BcBreadcrumbComponent'] },
+  'bc-shortcut':           { pkg: 'bc-shortcut',         standalones: ['BcShortcutGroupComponent','BcShortcutComponent'] },
+  'bc-shortcut-group':     { pkg: 'bc-shortcut',         standalones: ['BcShortcutGroupComponent','BcShortcutComponent'] },
+  'bc-stepper':            { pkg: 'bc-stepper',          standalones: ['BcStepperComponent'] },
+  'bc-alert':              { pkg: 'bc-alert',            standalones: ['BcAlertComponent'] },
+  'bc-inline-alert':       { pkg: 'bc-inline-alert',     standalones: ['BcInlineAlertComponent'] },
+  'bc-pictogram':          { pkg: 'bc-pictogram',        standalones: ['BcPictogramComponent'] },
+  'bc-tooltip':            { pkg: 'bc-tooltip',          standalones: ['BcTooltipDirective'] },
+  'bc-accordion':          { pkg: 'bc-accordion',        standalones: ['BcAccordionComponent','BcAccordionItemComponent'] },
+  'bc-accordion-item':     { pkg: 'bc-accordion',        standalones: ['BcAccordionItemComponent'] },
+  'bc-tabs':               { pkg: 'bc-tabs',             standalones: ['BcTabsComponent','BcTabComponent'] },
+  'bc-tab':                { pkg: 'bc-tabs',             standalones: ['BcTabComponent'] },
+  'bc-radio':              { pkg: 'bc-radio',            standalones: ['BcRadioComponent'] },
+  'bc-checkbox':           { pkg: 'bc-checkbox',         standalones: ['BcCheckboxComponent'] },
+  'bc-select':             { pkg: 'bc-select',           standalones: ['BcSelectComponent'] },
+  'bc-card':               { pkg: 'bc-card',             standalones: ['BcCardComponent'] },
+  'bc-tag':                { pkg: 'bc-tag',              standalones: ['BcTagComponent'] },
+  'bc-chip':               { pkg: 'bc-chip',             standalones: ['BcChipComponent'] },
+  'bc-badge':              { pkg: 'bc-badge',            standalones: ['BcBadgeComponent'] },
+  'bc-progress':           { pkg: 'bc-progress',         standalones: ['BcProgressComponent'] },
+  'bc-toggle':             { pkg: 'bc-toggle',           standalones: ['BcToggleComponent'] },
+  'bc-upload':             { pkg: 'bc-upload',           standalones: ['BcUploadComponent'] },
+  'bc-datepicker':         { pkg: 'bc-datepicker',       standalones: ['BcDatepickerComponent'] },
+  'bc-slider':             { pkg: 'bc-slider',           standalones: ['BcSliderComponent'] },
+  'bc-notification':       { pkg: 'bc-notification',     standalones: ['BcNotificationComponent'] },
+  'bc-spinner':            { pkg: 'bc-spinner',          standalones: ['BcSpinnerComponent'] },
+  'bc-dropdown':           { pkg: 'bc-dropdown',         standalones: ['BcDropdownComponent'] },
+  'bc-menu':               { pkg: 'bc-menu',             standalones: ['BcMenuComponent'] },
+  'bc-status':             { pkg: 'bc-status',           standalones: ['BcStatusComponent'] },
+  'bc-loader':             { pkg: 'bc-loader',           standalones: ['BcLoaderComponent'] },
+  'bc-input-date':         { pkg: 'bc-input-date',       standalones: ['BcInputDateComponent'] },
+  'bc-input-file':         { pkg: 'bc-input-file',       standalones: ['BcInputFileComponent'] },
+  'bc-input-select':       { pkg: 'bc-input-select',     standalones: ['BcInputSelectComponent'] },
+  'bc-stepper-v2':         { pkg: 'bc-stepper-v2',       standalones: ['BcStepperV2Component'] },
+  'bc-alert-dialog':       { pkg: 'bc-alert-dialog',     standalones: ['BcAlertDialogComponent'] },
+};
+
+// Directivas de atributo BDS
+const BDS_ATTR_STANDALONE = {
+  'bc-input':      { pkg: 'bc-input',   standalones: ['BcInputDirective','BcFormFieldComponent'] },
+  'bc-cell':       { pkg: 'bc-table',   standalones: ['BcCellDirective'] },
+  'bc-table':      { pkg: 'bc-table',   standalones: ['BcTableDirective'] },
+  'bc-button':     { pkg: 'bc-button',  standalones: ['BcButtonDirective'] },
+  'bc-input-file': { pkg: 'bc-upload',  standalones: ['BcInputFileDirective'] },
+  'bc-link':       { pkg: 'bc-button',  standalones: ['BcButtonDirective'] },
+};
+
+// Módulos BDS legacy → standalones (para limpiar imports de módulos viejos)
+const BDS_MODULE_TO_STANDALONE = {
+  BcCircleLoadingModule:  { pkg: 'bc-circle-loading',  standalones: ['BcCircleLoadingComponent'] },
+  BcSearchModule:         { pkg: 'bc-search',           standalones: ['BcSearchComponent','BcSearchLeftComponent','BcSearchAdvancedComponent','BcSearchAdvancedItemComponent','BcSearchResultFilterComponent','BcSearchButtonComponent','BcSearchContentItemsComponent'] },
+  BcInputModule:          { pkg: 'bc-input',            standalones: ['BcInputDirective','BcFormFieldComponent'] },
+  BcFormFieldModule:      { pkg: 'bc-input',            standalones: ['BcFormFieldComponent','BcInputDirective'] },
+  BcButtonModule:         { pkg: 'bc-button',           standalones: ['BcButtonDirective'] },
+  BcTableModule:          { pkg: 'bc-table',            standalones: ['BcTableDirective','BcCellDirective','BcTableContainerComponent','BcTableContentComponent','BcTableHeaderComponent','BcTableFooterComponent','BcTableDropdownComponent'] },
+  BcPaginatorV2Module:    { pkg: 'bc-paginator-v2',     standalones: ['BcPaginatorV2Component'] },
+  BcPaginatorModule:      { pkg: 'bc-paginator',        standalones: ['BcPaginatorComponent'] },
+  BcIconModule:           { pkg: 'bc-icon',             standalones: ['BcIconComponent'] },
+  BcModalModule:          { pkg: 'bc-modal',            standalones: ['BcModalComponent'] },
+  BcBreadcrumbModule:     { pkg: 'bc-breadcrumb',       standalones: ['BcBreadcrumbComponent'] },
+  BcShortcutModule:       { pkg: 'bc-shortcut',         standalones: ['BcShortcutGroupComponent','BcShortcutComponent'] },
+  BcStepperModule:        { pkg: 'bc-stepper',          standalones: ['BcStepperComponent'] },
+  BcAlertModule:          { pkg: 'bc-alert',            standalones: ['BcAlertComponent'] },
+  BcInlineAlertModule:    { pkg: 'bc-inline-alert',     standalones: ['BcInlineAlertComponent'] },
+  BcPictogramModule:      { pkg: 'bc-pictogram',        standalones: ['BcPictogramComponent'] },
+  BcTooltipModule:        { pkg: 'bc-tooltip',          standalones: ['BcTooltipDirective'] },
+  BcAccordionModule:      { pkg: 'bc-accordion',        standalones: ['BcAccordionComponent','BcAccordionItemComponent'] },
+  BcTabsModule:           { pkg: 'bc-tabs',             standalones: ['BcTabsComponent','BcTabComponent'] },
+  BcRadioModule:          { pkg: 'bc-radio',            standalones: ['BcRadioComponent'] },
+  BcCheckboxModule:       { pkg: 'bc-checkbox',         standalones: ['BcCheckboxComponent'] },
+  BcSelectModule:         { pkg: 'bc-select',           standalones: ['BcSelectComponent'] },
+  BcCardModule:           { pkg: 'bc-card',             standalones: ['BcCardComponent'] },
+  BcTagModule:            { pkg: 'bc-tag',              standalones: ['BcTagComponent'] },
+  BcChipModule:           { pkg: 'bc-chip',             standalones: ['BcChipComponent'] },
+  BcBadgeModule:          { pkg: 'bc-badge',            standalones: ['BcBadgeComponent'] },
+  BcProgressModule:       { pkg: 'bc-progress',         standalones: ['BcProgressComponent'] },
+  BcToggleModule:         { pkg: 'bc-toggle',           standalones: ['BcToggleComponent'] },
+  BcUploadModule:         { pkg: 'bc-upload',           standalones: ['BcUploadComponent'] },
+  BcDatepickerModule:     { pkg: 'bc-datepicker',       standalones: ['BcDatepickerComponent'] },
+  BcInputDateModule:      { pkg: 'bc-input-date',       standalones: ['BcInputDateComponent'] },
+  BcInputFileModule:      { pkg: 'bc-input-file',       standalones: ['BcInputFileComponent'] },
+  BcInputSelectModule:    { pkg: 'bc-input-select',     standalones: ['BcInputSelectComponent'] },
+  BcSliderModule:         { pkg: 'bc-slider',           standalones: ['BcSliderComponent'] },
+  BcNotificationModule:   { pkg: 'bc-notification',     standalones: ['BcNotificationComponent'] },
+  BcSpinnerModule:        { pkg: 'bc-spinner',          standalones: ['BcSpinnerComponent'] },
+  BcDropdownModule:       { pkg: 'bc-dropdown',         standalones: ['BcDropdownComponent'] },
+  BcMenuModule:           { pkg: 'bc-menu',             standalones: ['BcMenuComponent'] },
+  BcLoaderModule:         { pkg: 'bc-loader',           standalones: ['BcLoaderComponent'] },
+  BcStatusModule:         { pkg: 'bc-status',           standalones: ['BcStatusComponent'] },
+  BcStepperV2Module:      { pkg: 'bc-stepper-v2',       standalones: ['BcStepperV2Component'] },
+  BcAlertDialogModule:    { pkg: 'bc-alert-dialog',     standalones: ['BcAlertDialogComponent'] },
+  BcServicesModule:       { pkg: 'bc-services',         standalones: ['BcDialogService'] },
+};
+
+/**
+ * Construye un índice de TODOS los componentes internos del proyecto.
+ * selector → { className, filePath }
+ * Escanea todos los .ts buscando selector: 'bc-*' o selector: 'app-*'
+ */
+function buildProjectSelectorIndex(srcRoots) {
+  const index = {}; // selector → { className, filePath }
+  for (const root of srcRoots) {
+    const files = getAllFiles(root, '.ts').filter(f => !f.endsWith('.spec.ts'));
+    for (const f of files) {
+      try {
+        const content = fs.readFileSync(f, 'utf-8');
+        // Buscar selector en @Component({ selector: '...' })
+        const selectorMatch = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
+        const classMatch    = content.match(/export\s+class\s+(\w+)/);
+        if (selectorMatch && classMatch) {
+          index[selectorMatch[1]] = {
+            className: classMatch[1],
+            filePath: f,
+          };
+        }
+      } catch {}
+    }
+  }
+  return index;
+}
+
+/**
+ * Dado un archivo .ts y su .html, determina:
+ * 1. Qué componentes BDS standalone necesita (desde HTML tags)
+ * 2. Qué componentes BDS legacy (Módulos) tiene que reemplazar
+ * 3. Qué componentes internos del proyecto necesita importar
+ * Y retorna el archivo .ts actualizado.
+ */
+function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
+  if (!projectSelectorIndex) projectSelectorIndex = {};
   const ts   = fs.readFileSync(filePath, 'utf-8');
   const html = htmlPath && fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
 
-  const detected = new Set();
+  // ── 1. Recolectar standalones BDS necesarios desde HTML ──────────────
+  const bdsNeeded = new Map(); // pkg → Set<standalone>
 
-  // Detectar en TS
-  for (const name of Object.keys(BDS_MAP)) {
-    if (new RegExp(`\\b${name}\\b`).test(ts)) detected.add(name);
-  }
+  const addBdsStandalone = (pkg, standalones) => {
+    if (!bdsNeeded.has(pkg)) bdsNeeded.set(pkg, new Set());
+    standalones.forEach(s => bdsNeeded.get(pkg).add(s));
+  };
 
-  // Detectar en HTML
   if (html) {
-    for (const [tag, mod] of Object.entries(HTML_TAG_MAP)) {
-      if (new RegExp(`<${tag.replace(/-/g,'\\-')}[\\s>/]`).test(html)) detected.add(mod);
+    for (const [tag, entry] of Object.entries(BDS_STANDALONE_MAP)) {
+      if (new RegExp('<' + tag.replace(/-/g,'\\-') + '[\\s>/]').test(html)) {
+        addBdsStandalone(entry.pkg, entry.standalones);
+      }
     }
-    for (const [attr, info] of Object.entries(ATTR_MAP)) {
-      if (new RegExp(`\\b${attr.replace(/-/g,'\\-')}\\b`).test(html)) detected.add(info.module);
+    for (const [attr, entry] of Object.entries(BDS_ATTR_STANDALONE)) {
+      if (new RegExp('\\b' + attr.replace(/-/g,'\\-') + '[=\\s>/"\'`]').test(html)) {
+        addBdsStandalone(entry.pkg, entry.standalones);
+      }
     }
   }
 
-  if (!detected.size) return null;
-
-  // Construir grupos pkg → standalones
-  const groups = {};
-  for (const name of detected) {
-    const info = BDS_MAP[name];
-    if (!info) continue;
-    if (!groups[info.pkg]) groups[info.pkg] = new Set();
-    info.standalone.forEach(s => groups[info.pkg].add(s));
+  // ── 2. Detectar módulos BDS legacy en el TS ───────────────────────────
+  const legacyModulesFound = new Set();
+  for (const [modName, entry] of Object.entries(BDS_MODULE_TO_STANDALONE)) {
+    if (new RegExp('\\b' + modName + '\\b').test(ts)) {
+      legacyModulesFound.add(modName);
+      addBdsStandalone(entry.pkg, entry.standalones);
+    }
   }
+
+  // ── 3. Filtrar los que ya están importados en el TS ───────────────────
+  const bdsToAdd = new Map();
+  for (const [pkg, standalones] of bdsNeeded) {
+    const missing = [...standalones].filter(s => !new RegExp('\\b' + s + '\\b').test(ts));
+    if (missing.length > 0) bdsToAdd.set(pkg, new Set(missing));
+  }
+
+  // ── 4. Detectar componentes internos desde HTML ───────────────────────
+  const internalToAdd = [];
+
+  if (html && Object.keys(projectSelectorIndex).length > 0) {
+    const tagRe = /<(bc-[a-z0-9-]+|app-[a-z0-9-]+)[\s>/]/g;
+    let tagMatch;
+    const seenSelectors = new Set();
+    while ((tagMatch = tagRe.exec(html)) !== null) {
+      const tag = tagMatch[1];
+      if (BDS_STANDALONE_MAP[tag]) continue;
+      if (seenSelectors.has(tag)) continue;
+      seenSelectors.add(tag);
+      const entry = projectSelectorIndex[tag];
+      if (!entry) continue;
+      if (new RegExp('\\b' + entry.className + '\\b').test(ts)) continue;
+      const rel = path.relative(path.dirname(filePath), entry.filePath)
+        .replace(/\.ts$/, '').replace(/\\/g, '/');
+      const relPath = rel.startsWith('.') ? rel : './' + rel;
+      internalToAdd.push({ className: entry.className, importPath: relPath, selector: tag });
+    }
+  }
+
+  // ── 5. Nada que hacer ────────────────────────────────────────────────
+  if (legacyModulesFound.size === 0 && bdsToAdd.size === 0 && internalToAdd.length === 0) return null;
 
   let result = ts;
 
-  // Eliminar imports viejos
-  for (const name of detected) {
+  // ── 6. Eliminar imports de módulos BDS legacy ─────────────────────────
+  for (const modName of legacyModulesFound) {
     result = result.replace(
-      new RegExp(`import\\s*\\{[^}]*\\b${name}\\b[^}]*\\}\\s*from\\s*['"][^'"]+['"];?\\r?\\n?`, 'g'),
+      new RegExp('import\\s*\\{[^}]*\\b' + modName + '\\b[^}]*\\}\\s*from\\s*[\'"][^\'"]+[\'"];?\\r?\\n?', 'g'),
       ''
     );
   }
 
-  // Nuevas líneas import
-  const newLines = Object.entries(groups)
-    .map(([pkg, names]) => `import { ${[...names].join(', ')} } from '@bancolombia/design-system-web/${pkg}';`)
-    .join('\n');
+  // ── 7. Agregar imports BDS standalone faltantes ───────────────────────
+  if (bdsToAdd.size > 0) {
+    const newBdsLines = [...bdsToAdd.entries()]
+      .map(([pkg, names]) => "import { " + [...names].join(', ') + " } from '@bancolombia/design-system-web/" + pkg + "';")
+      .join('\n');
+    const firstImport = result.search(/^import /m);
+    result = firstImport >= 0
+      ? result.substring(0, firstImport) + newBdsLines + '\n' + result.substring(firstImport)
+      : newBdsLines + '\n' + result;
+  }
 
-  const firstImport = result.search(/^import /m);
-  result = firstImport >= 0
-    ? result.substring(0, firstImport) + newLines + '\n' + result.substring(firstImport)
-    : newLines + '\n' + result;
+  // ── 8. Agregar imports de componentes internos faltantes ──────────────
+  if (internalToAdd.length > 0) {
+    const newInternalLines = internalToAdd
+      .map(e => "import { " + e.className + " } from '" + e.importPath + "';")
+      .join('\n');
+    const firstImport = result.search(/^import /m);
+    result = firstImport >= 0
+      ? result.substring(0, firstImport) + newInternalLines + '\n' + result.substring(firstImport)
+      : newInternalLines + '\n' + result;
+  }
 
-  // Reemplazar bloque imports: [...]
-  result = result.replace(/imports:\s*\[([^\]]*)\]/s, (_, inner) => {
+  // ── 9. Actualizar bloque imports: [...] ───────────────────────────────
+  result = result.replace(/imports\s*:\s*\[([^\]]*)\]/s, (_, inner) => {
     let cleaned = inner;
-    for (const name of detected) {
-      cleaned = cleaned.replace(new RegExp(`\\b${name}\\b,?\\s*`, 'g'), '');
+    for (const modName of legacyModulesFound) {
+      cleaned = cleaned.replace(
+        new RegExp('\\b' + modName + '\\s*\\.forRoot\\s*\\((?:[^)(]|\\([^)]*\\))*\\)\\s*,?\\s*', 'gs'), ''
+      );
+      cleaned = cleaned.replace(new RegExp('\\b' + modName + '\\b,?\\s*', 'g'), '');
     }
-    const existing = cleaned.split(',').map(s => s.trim()).filter(s => s && !BDS_MAP[s]);
-    const allNew   = [...new Set(Object.values(groups).flatMap(s => [...s]))];
-    const combined = [...new Set([...allNew, ...existing])];
+    const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
+      s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
+    );
+    const allBdsNew      = [...new Set([...bdsToAdd.values()].flatMap(s => [...s]))];
+    const allInternalNew = internalToAdd.map(e => e.className);
+    const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
     const fmt = combined.length > 3
       ? '\n        ' + combined.join(',\n        ') + ',\n    '
       : combined.join(', ');
-    return `imports: [${fmt}]`;
+    return 'imports: [' + fmt + ']';
   });
 
   result = result.replace(/\n{3,}/g, '\n\n');
 
-  return { result, detected: [...detected] };
+  return {
+    result,
+    legacyModules: [...legacyModulesFound],
+    bdsAdded: [...bdsToAdd.entries()].map(([pkg, s]) => [...s].join(', ') + ' (' + pkg + ')'),
+    internalAdded: internalToAdd.map(e => e.className + ' \u2190 ' + e.selector),
+  };
 }
 
 async function migrateBDS(projectInfo) {
   print(title('MIGRACIÓN BDS (módulos → standalone)'));
 
-  const bdsModules = detectBdsModules();
-  if (bdsModules.length === 0) {
-    print(ok('No se detectaron módulos BDS legacy. Nada que migrar.')); return;
+  print(info('Indexando componentes del proyecto...'));
+  const srcRoots = [
+    path.join(projectPath, 'src'),
+    path.join(projectPath, 'projects'),
+  ].filter(d => fs.existsSync(d));
+
+  const projectSelectorIndex = buildProjectSelectorIndex(srcRoots);
+  print(info('Componentes internos indexados: ' + Object.keys(projectSelectorIndex).length));
+
+  const tsFiles = [
+    ...getAllFiles(path.join(projectPath, 'src'), '.ts'),
+    ...getAllFiles(path.join(projectPath, 'projects'), '.ts'),
+  ].filter(f => !f.endsWith('.spec.ts') && !f.endsWith('.module.ts'));
+
+  let filesWithLegacy = 0, filesWithMissingBds = 0, filesWithMissingInternal = 0;
+  for (const tsFile of tsFiles) {
+    const dir = path.dirname(tsFile);
+    const base = path.basename(tsFile, '.ts');
+    const htmlFile = path.join(dir, base + '.html');
+    const r = migrateTsFile(tsFile, fs.existsSync(htmlFile) ? htmlFile : null, projectSelectorIndex);
+    if (!r) continue;
+    if (r.legacyModules.length > 0)   filesWithLegacy++;
+    if (r.bdsAdded.length > 0)        filesWithMissingBds++;
+    if (r.internalAdded.length > 0)   filesWithMissingInternal++;
   }
 
-  print(info(`Módulos BDS detectados: ${bdsModules.length}`));
-  bdsModules.forEach(m => print(`    ${dim('·')} ${m}`));
+  if (filesWithLegacy === 0 && filesWithMissingBds === 0 && filesWithMissingInternal === 0) {
+    print(ok('Todos los componentes BDS e internos ya están importados correctamente.'));
+    return;
+  }
 
-  print(warn(`\n  Se procesarán automáticamente TODOS los archivos .ts del proyecto.`));
-  print(dim(`  Se empareja cada .ts con su .html del mismo directorio si existe.\n`));
+  print('');
+  if (filesWithLegacy > 0)          print(warn('  Módulos BDS legacy a reemplazar : ' + filesWithLegacy + ' archivo(s)'));
+  if (filesWithMissingBds > 0)      print(warn('  Standalones BDS faltantes       : ' + filesWithMissingBds + ' archivo(s)'));
+  if (filesWithMissingInternal > 0) print(warn('  Componentes internos faltantes  : ' + filesWithMissingInternal + ' archivo(s)'));
+  print('');
 
   const dryRun = await prompt('  ¿Ejecutar en modo dry-run (solo muestra cambios sin guardar)? (s/n): ');
   const isDry  = dryRun.toLowerCase() === 's';
 
-  const confirm = await prompt(`  ¿${isDry ? 'Mostrar' : 'Aplicar'} migración BDS? (s/n): `);
+  const confirm = await prompt('  ¿' + (isDry ? 'Mostrar' : 'Aplicar') + ' migración BDS? (s/n): ');
   if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
 
-  const tsFiles = getAllFiles(path.join(projectPath, 'src'), '.ts');
   let changed = 0, skipped = 0;
 
   for (const tsFile of tsFiles) {
@@ -501,34 +736,33 @@ async function migrateBDS(projectInfo) {
     const base     = path.basename(tsFile, '.ts');
     const htmlFile = path.join(dir, base + '.html');
 
-    const migResult = migrateTsFile(tsFile, htmlFile);
+    const migResult = migrateTsFile(
+      tsFile,
+      fs.existsSync(htmlFile) ? htmlFile : null,
+      projectSelectorIndex
+    );
     if (!migResult) { skipped++; continue; }
 
     const rel = path.relative(projectPath, tsFile);
-    print(`\n  ${C.cyan}→${C.reset} ${rel}`);
-    migResult.detected.forEach(m => print(`    ${C.dim}· ${m} → standalone${C.reset}`));
+    print('\n  ' + C.cyan + '\u2192' + C.reset + ' ' + rel);
+    if (migResult.legacyModules.length)  migResult.legacyModules.forEach(m => print('    ' + dim('✖ módulo legacy eliminado: ' + m)));
+    if (migResult.bdsAdded.length)       migResult.bdsAdded.forEach(s  => print('    ' + ok('BDS standalone agregado: ' + s)));
+    if (migResult.internalAdded.length)  migResult.internalAdded.forEach(s => print('    ' + ok('Componente interno agregado: ' + s)));
 
     if (!isDry) {
       fs.writeFileSync(tsFile, migResult.result, 'utf-8');
-      print(`    ${ok('guardado')}`);
+      print('    ' + ok('guardado'));
     } else {
-      print(`    ${dim('[dry-run: no se guardó]')}`);
+      print('    ' + dim('[dry-run: no se guardó]'));
     }
-
     changed++;
   }
 
   separator();
-  print(ok(`BDS: ${changed} archivos ${isDry ? 'analizados' : 'migrados'}, ${skipped} sin cambios.`));
-
-  if (!isDry && changed > 0) {
-    const doCommit = await prompt('\n  ¿Hacer commit de los cambios BDS? (s/n): ');
-    if (doCommit.toLowerCase() === 's') {
-      runCmd('git add .');
-      runCmd('git commit -m "chore: migrate BDS modules to standalone imports"');
-    }
-  }
+  print(ok('BDS: ' + changed + ' archivos ' + (isDry ? 'analizados' : 'migrados') + ', ' + skipped + ' sin cambios.'));
 }
+
+
 
 // ─── STANDALONE MIGRATION ───────────────────────────────────
 async function migrateStandalone() {
