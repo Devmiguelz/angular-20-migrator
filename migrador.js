@@ -669,8 +669,10 @@ function extractCoreUtilsSymbols(content) {
 
 /** Elimina todas las líneas de import de core-utils */
 function removeCoreUtilsImports(content) {
+  // Usa [\s\S]*? en lugar de [^}]+ para manejar llaves anidadas
+  // (ocurre cuando transformConfiguration reemplaza nombres dentro del bloque import)
   return content.replace(
-    /import\s*\{[^}]+\}\s*from\s*['"]@bancolombia\/core-utils-widgets-web['"];?\r?\n?/g,
+    /import\s*\{[\s\S]*?\}\s*from\s*['"]@bancolombia\/core-utils-widgets-web['"];?\r?\n?/g,
     ''
   );
 }
@@ -794,7 +796,7 @@ function transformConfiguration(content, symbols) {
 
   // Reemplazar el bloque for..of que construye infrastructures por un .map() limpio
   r = r.replace(
-    /const infrastructures\s*=\s*\[\s*\];\s*for\s*\(const item of DEFAULT_CONFIGURATION\.infrastructures[^)]*\)\s*\{[^}]*infrastructures\.push\(\{[^}]*provide:\s*item\.gateway,\s*useClass:\s*item\.implementation[^}]*\}\s*\);\s*\}/g,
+    /const infrastructures\s*=\s*\[\s*\];\s*for\s*\(const item of DEFAULT_CONFIGURATION\.infrastructures[^)]*\)\s*\{[\s\S]*?infrastructures\.push\(\{[\s\S]*?provide:\s*item\.gateway,\s*useClass:\s*item\.implementation[\s\S]*?\}\s*\);\s*\}/g,
     `const infrastructures = (DEFAULT_CONFIGURATION.infrastructures || []).map(item => ({\n  provide: item.gateway,\n  useClass: item.implementation,\n}));`
   );
 
@@ -891,14 +893,16 @@ async function removeCoreUtils() {
     let result = original;
 
     // Aplicar transformaciones según los symbols detectados
+    // Eliminar la línea de import de core-utils PRIMERO
+    // (evita que los reemplazos de nombres dentro del bloque import rompan el regex de remoción)
+    result = removeCoreUtilsImports(result);
+
+    // Aplicar transformaciones según los symbols detectados
     result = transformGateway(result, symbols);
     result = transformDrivenAdapter(result, symbols);
     result = transformConfiguration(result, symbols);
     result = transformUsecase(result, symbols);
     result = transformMapper(result, symbols);
-
-    // Eliminar la línea de import de core-utils
-    result = removeCoreUtilsImports(result);
 
     // Limpiar líneas en blanco triples
     result = result.replace(/\n{3,}/g, '\n\n');
@@ -1314,8 +1318,8 @@ function parseMFModule(projPath) {
 
   // Detectar el template selector del main.single-spa.ts
   const mainSpaContent = fs.readFileSync(path.join(projPath, 'src', 'main.single-spa.ts'), 'utf-8');
-  const templateMatch  = mainSpaContent.match(/template\s*:\s*['"]<([^>'"]+)\s*\/>['"]/);
-  const spaTemplate    = templateMatch ? templateMatch[1] : 'mf-widget';
+  const templateMatch  = mainSpaContent.match(/template\s*:\s*['"]<([^>'"]+?)\s*\/>['"]/);
+  const spaTemplate    = templateMatch ? templateMatch[1].trim() : 'mf-widget';
 
   // Detectar si hay imports adicionales en app.module (BcIllustrationModule etc.)
   const extraModuleImports = [];
