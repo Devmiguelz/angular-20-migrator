@@ -525,25 +525,35 @@ const BDS_MODULE_TO_STANDALONE = {
  * Escanea todos los .ts buscando selector: 'bc-*' o selector: 'app-*'
  */
 function buildProjectSelectorIndex(srcRoots) {
-  const index = {}; // selector → { className, filePath }
+  // index de selectores de componentes/directivas: 'bc-foo' → { className, filePath }
+  const selectorIndex = {};
+  // index de pipes por nombre: 'myPipe' → { className, filePath }
+  const pipeIndex = {};
+
   for (const root of srcRoots) {
     const files = getAllFiles(root, '.ts').filter(f => !f.endsWith('.spec.ts'));
     for (const f of files) {
       try {
         const content = fs.readFileSync(f, 'utf-8');
-        // Buscar selector en @Component({ selector: '...' })
+        const classMatch = content.match(/export\s+class\s+(\w+)/);
+        if (!classMatch) continue;
+        const className = classMatch[1];
+
+        // Componentes y Directivas — indexar por selector
         const selectorMatch = content.match(/selector\s*:\s*['"]([^'"]+)['"]/);
-        const classMatch    = content.match(/export\s+class\s+(\w+)/);
-        if (selectorMatch && classMatch) {
-          index[selectorMatch[1]] = {
-            className: classMatch[1],
-            filePath: f,
-          };
+        if (selectorMatch) {
+          selectorIndex[selectorMatch[1]] = { className, filePath: f };
+        }
+
+        // Pipes — indexar por nombre del pipe
+        const pipeNameMatch = content.match(/@Pipe\s*\([^)]*name\s*:\s*['"]([^'"]+)['"]/);
+        if (pipeNameMatch) {
+          pipeIndex[pipeNameMatch[1]] = { className, filePath: f };
         }
       } catch {}
     }
   }
-  return index;
+  return { selectorIndex, pipeIndex };
 }
 
 /**
@@ -553,8 +563,10 @@ function buildProjectSelectorIndex(srcRoots) {
  * 3. Qué componentes internos del proyecto necesita importar
  * Y retorna el archivo .ts actualizado.
  */
-function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
-  if (!projectSelectorIndex) projectSelectorIndex = {};
+function migrateTsFile(filePath, htmlPath, projectIndex) {
+  if (!projectIndex) projectIndex = {};
+  const projectSelectorIndex = projectIndex.selectorIndex || projectIndex; // compat
+  const projectPipeIndex     = projectIndex.pipeIndex     || {};
   const ts   = fs.readFileSync(filePath, 'utf-8');
   const html = htmlPath && fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf-8') : '';
 
@@ -606,42 +618,53 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     if (missing.length > 0) bdsToAdd.set(pkg, new Set(missing));
   }
 
-  // ── 5. Detectar símbolos Angular que están en TS pero faltan en imports:[] ─
-  // CommonModule, FormsModule, ReactiveFormsModule, RouterLink, RouterModule, etc.
-  const ANGULAR_MODULE_MAP = {
-    'CommonModule':         { pkg: '@angular/common',      symbol: 'CommonModule' },
-    'FormsModule':          { pkg: '@angular/forms',       symbol: 'FormsModule' },
-    'ReactiveFormsModule':  { pkg: '@angular/forms',       symbol: 'ReactiveFormsModule' },
-    'RouterModule':         { pkg: '@angular/router',      symbol: 'RouterModule' },
-    'RouterLink':           { pkg: '@angular/router',      symbol: 'RouterLink' },
-    'RouterOutlet':         { pkg: '@angular/router',      symbol: 'RouterOutlet' },
-    'AsyncPipe':            { pkg: '@angular/common',      symbol: 'AsyncPipe' },
-    'NgIf':                 { pkg: '@angular/common',      symbol: 'NgIf' },
-    'NgFor':                { pkg: '@angular/common',      symbol: 'NgFor' },
-    'NgClass':              { pkg: '@angular/common',      symbol: 'NgClass' },
-    'NgStyle':              { pkg: '@angular/common',      symbol: 'NgStyle' },
-    'NgSwitch':             { pkg: '@angular/common',      symbol: 'NgSwitch' },
-    'NgSwitchCase':         { pkg: '@angular/common',      symbol: 'NgSwitchCase' },
-    'NgSwitchDefault':      { pkg: '@angular/common',      symbol: 'NgSwitchDefault' },
-    'DatePipe':             { pkg: '@angular/common',      symbol: 'DatePipe' },
-    'DecimalPipe':          { pkg: '@angular/common',      symbol: 'DecimalPipe' },
-    'CurrencyPipe':         { pkg: '@angular/common',      symbol: 'CurrencyPipe' },
-    'UpperCasePipe':        { pkg: '@angular/common',      symbol: 'UpperCasePipe' },
-    'LowerCasePipe':        { pkg: '@angular/common',      symbol: 'LowerCasePipe' },
-    'JsonPipe':             { pkg: '@angular/common',      symbol: 'JsonPipe' },
-    'SlicePipe':            { pkg: '@angular/common',      symbol: 'SlicePipe' },
-    'PercentPipe':          { pkg: '@angular/common',      symbol: 'PercentPipe' },
+  // ── 5. Detectar módulos/directivas Angular que están en TS pero faltan en imports[] ─
+  // SOLO los que genuinamente van en imports[] de un componente standalone.
+  // NO incluir: servicios (Router, ActivatedRoute), clases de formulario (FormBuilder,
+  // Validators), decoradores, interfaces, etc.
+  const ANGULAR_IMPORTABLE = {
+    // @angular/common — módulos y directivas/pipes que van en imports[]
+    'CommonModule':         '@angular/common',
+    'NgIf':                 '@angular/common',
+    'NgFor':                '@angular/common',
+    'NgForOf':              '@angular/common',
+    'NgClass':              '@angular/common',
+    'NgStyle':              '@angular/common',
+    'NgSwitch':             '@angular/common',
+    'NgSwitchCase':         '@angular/common',
+    'NgSwitchDefault':      '@angular/common',
+    'NgTemplateOutlet':     '@angular/common',
+    'AsyncPipe':            '@angular/common',
+    'DatePipe':             '@angular/common',
+    'DecimalPipe':          '@angular/common',
+    'CurrencyPipe':         '@angular/common',
+    'UpperCasePipe':        '@angular/common',
+    'LowerCasePipe':        '@angular/common',
+    'JsonPipe':             '@angular/common',
+    'SlicePipe':            '@angular/common',
+    'PercentPipe':          '@angular/common',
+    'TitleCasePipe':        '@angular/common',
+    'KeyValuePipe':         '@angular/common',
+    // @angular/forms — módulos que van en imports[]
+    'FormsModule':          '@angular/forms',
+    'ReactiveFormsModule':  '@angular/forms',
+    // @angular/router — directivas que van en imports[]
+    'RouterModule':         '@angular/router',
+    'RouterLink':           '@angular/router',
+    'RouterLinkActive':     '@angular/router',
+    'RouterOutlet':         '@angular/router',
   };
-  const angularToAdd = []; // { symbol }
-  for (const [symbol, info] of Object.entries(ANGULAR_MODULE_MAP)) {
-    // Está en el import statement del TS pero NO en imports:[]
-    const inImportStatement = new RegExp("import\\s*\\{[^}]*\\b" + symbol + "\\b[^}]*\\}\\s*from\\s*['\"']" + info.pkg.replace(/\//g,'\\/') + "['\"']").test(ts);
-    if (inImportStatement && !existingInImportsBlock.has(symbol)) {
+  const angularToAdd = [];
+  for (const [symbol, pkg] of Object.entries(ANGULAR_IMPORTABLE)) {
+    if (existingInImportsBlock.has(symbol)) continue;
+    // El símbolo debe estar en un import statement del TS apuntando al paquete correcto
+    const re = new RegExp("import\\s*(?:type\\s*)?\\{[^}]*\\b" + symbol + "\\b[^}]*\\}\\s*from\\s*['\"']" + pkg.replace(/\//g,'\\/') + "['\"']");
+    if (re.test(ts)) {
       angularToAdd.push(symbol);
     }
   }
 
-  // ── 6. Detectar componentes internos desde HTML ───────────────────────
+  // ── 6. Detectar componentes internos desde HTML (tags) ──────────────
   const internalToAdd = [];
 
   if (html && Object.keys(projectSelectorIndex).length > 0) {
@@ -663,8 +686,58 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     }
   }
 
+  // ── 7. Detectar pipes del proyecto usados en HTML (| pipeName) ────────
+  const pipesToAdd = [];
+
+  if (html && Object.keys(projectPipeIndex).length > 0) {
+    // Buscar todos los pipes usados en templates: {{ value | pipeName }} o *ngIf="x | pipeName"
+    const pipeRe = /\|\s*([a-zA-Z][a-zA-Z0-9_]*)/g;
+    let pipeMatch;
+    const seenPipes = new Set();
+    while ((pipeMatch = pipeRe.exec(html)) !== null) {
+      const pipeName = pipeMatch[1];
+      if (seenPipes.has(pipeName)) continue;
+      seenPipes.add(pipeName);
+      const entry = projectPipeIndex[pipeName];
+      if (!entry) continue;
+      if (existingInImportsBlock.has(entry.className)) continue;
+      const rel = path.relative(path.dirname(filePath), entry.filePath)
+        .replace(/\.ts$/, '').replace(/\\/g, '/');
+      const relPath = rel.startsWith('.') ? rel : './' + rel;
+      pipesToAdd.push({ className: entry.className, importPath: relPath, pipeName });
+    }
+  }
+
+  // ── 8. Detectar BDS que están en TS (import stmt) pero NO en imports[] ─
+  // Cubre: ViewChild, inject(), dialog.open(BcAlertComponent), etc. sin tag HTML
+  // Estrategia: buscar TODOS los standalones BDS en el import statement del TS
+  const bdsFromTs = [];
+  const seenBdsFromTs = new Set();
+  // Mapa completo de símbolo BDS → pkg
+  const ALL_BDS_STANDALONES = {};
+  for (const entry of Object.values(BDS_MODULE_TO_STANDALONE)) {
+    for (const s of entry.standalones) {
+      ALL_BDS_STANDALONES[s] = entry.pkg;
+    }
+  }
+  // BDS standalone extra no cubiertos por módulos
+  ALL_BDS_STANDALONES['BcDialogService'] = 'bc-services';
+
+  for (const [standalone, pkg] of Object.entries(ALL_BDS_STANDALONES)) {
+    if (existingInImportsBlock.has(standalone)) continue;
+    if (seenBdsFromTs.has(standalone)) continue;
+    // ¿Está en el import statement del TS?
+    const importRe = new RegExp("import\\s*(?:type\\s*)?\\{[^}]*\\b" + standalone + "\\b[^}]*\\}\\s*from\\s*['\"']@bancolombia");
+    if (!importRe.test(ts)) continue;
+    // ¿Ya lo cubre bdsToAdd (detectado desde HTML)?
+    const alreadyInBdsToAdd = [...bdsToAdd.values()].some(s => s.has(standalone));
+    if (alreadyInBdsToAdd) continue;
+    seenBdsFromTs.add(standalone);
+    bdsFromTs.push({ standalone, pkg });
+  }
+
   // ── 5. Nada que hacer ────────────────────────────────────────────────
-  if (legacyModulesFound.size === 0 && bdsToAdd.size === 0 && internalToAdd.length === 0 && angularToAdd.length === 0) return null;
+  if (legacyModulesFound.size === 0 && bdsToAdd.size === 0 && internalToAdd.length === 0 && angularToAdd.length === 0 && pipesToAdd.length === 0 && bdsFromTs.length === 0) return null;
 
   let result = ts;
 
@@ -687,15 +760,32 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       : newBdsLines + '\n' + result;
   }
 
-  // ── 8. Agregar imports de componentes internos faltantes ──────────────
+  // ── 8. Agregar imports de componentes internos, pipes y BDS desde TS ──
+  const allNewImportLines = [];
   if (internalToAdd.length > 0) {
-    const newInternalLines = internalToAdd
-      .map(e => "import { " + e.className + " } from '" + e.importPath + "';")
-      .join('\n');
+    internalToAdd.forEach(e => allNewImportLines.push("import { " + e.className + " } from '" + e.importPath + "';"));
+  }
+  if (pipesToAdd.length > 0) {
+    pipesToAdd.forEach(e => allNewImportLines.push("import { " + e.className + " } from '" + e.importPath + "';"));
+  }
+  // bdsFromTs: agrupar por pkg y agregar imports si no existen ya
+  const bdsFromTsByPkg = {};
+  for (const { standalone, pkg } of bdsFromTs) {
+    if (!bdsFromTsByPkg[pkg]) bdsFromTsByPkg[pkg] = new Set();
+    bdsFromTsByPkg[pkg].add(standalone);
+  }
+  for (const [pkg, names] of Object.entries(bdsFromTsByPkg)) {
+    const existing = new RegExp("from '@bancolombia/design-system-web/" + pkg + "'").test(result);
+    if (!existing) {
+      allNewImportLines.push("import { " + [...names].join(', ') + " } from '@bancolombia/design-system-web/" + pkg + "';");
+    }
+  }
+  if (allNewImportLines.length > 0) {
+    const newLines = allNewImportLines.join('\n');
     const firstImport = result.search(/^import /m);
     result = firstImport >= 0
-      ? result.substring(0, firstImport) + newInternalLines + '\n' + result.substring(firstImport)
-      : newInternalLines + '\n' + result;
+      ? result.substring(0, firstImport) + newLines + '\n' + result.substring(firstImport)
+      : newLines + '\n' + result;
   }
 
   // ── 9. Actualizar o CREAR bloque imports: [...] dentro de @Component ──
@@ -716,7 +806,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
         s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
       );
-      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew, ...angularToAdd])].filter(Boolean);
+      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew, ...angularToAdd, ...pipesToAdd.map(p=>p.className), ...bdsFromTs.map(b=>b.standalone)])].filter(Boolean);
       const fmt = combined.length > 3
         ? '\n        ' + combined.join(',\n        ') + ',\n    '
         : combined.join(', ');
@@ -724,7 +814,7 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     });
   } else {
     // NO existe imports: [] — crearlo dentro del @Component({})
-    const combined = [...new Set([...allBdsNew, ...allInternalNew, ...angularToAdd])].filter(Boolean);
+    const combined = [...new Set([...allBdsNew, ...allInternalNew, ...angularToAdd, ...pipesToAdd.map(p=>p.className), ...bdsFromTs.map(b=>b.standalone)])].filter(Boolean);
     if (combined.length > 0) {
       const fmt = combined.length > 3
         ? '\n        ' + combined.join(',\n        ') + ',\n    '
@@ -754,6 +844,8 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
     bdsAdded: [...bdsToAdd.entries()].map(([pkg, s]) => [...s].join(', ') + ' (' + pkg + ')'),
     internalAdded: internalToAdd.map(e => e.className + ' \u2190 ' + e.selector),
     angularAdded: angularToAdd,
+    pipesAdded: pipesToAdd.map(p => p.className + ' \u2190 |' + p.pipeName),
+    bdsFromTsAdded: bdsFromTs.map(b => b.standalone + ' (' + b.pkg + ')'),
   };
 }
 
@@ -766,8 +858,11 @@ async function migrateBDS(projectInfo) {
     path.join(projectPath, 'projects'),
   ].filter(d => fs.existsSync(d));
 
-  const projectSelectorIndex = buildProjectSelectorIndex(srcRoots);
+  const projectIndex = buildProjectSelectorIndex(srcRoots);
+  const projectSelectorIndex = projectIndex.selectorIndex;
+  const projectPipeIndex     = projectIndex.pipeIndex;
   print(info('Componentes internos indexados: ' + Object.keys(projectSelectorIndex).length));
+  print(info('Pipes del proyecto indexados   : ' + Object.keys(projectPipeIndex).length));
 
   const tsFiles = [
     ...getAllFiles(path.join(projectPath, 'src'), '.ts'),
@@ -779,7 +874,7 @@ async function migrateBDS(projectInfo) {
     const dir = path.dirname(tsFile);
     const base = path.basename(tsFile, '.ts');
     const htmlFile = path.join(dir, base + '.html');
-    const r = migrateTsFile(tsFile, fs.existsSync(htmlFile) ? htmlFile : null, projectSelectorIndex);
+    const r = migrateTsFile(tsFile, fs.existsSync(htmlFile) ? htmlFile : null, projectIndex);
     if (!r) continue;
     if (r.legacyModules.length > 0)                    filesWithLegacy++;
     if (r.bdsAdded.length > 0)                         filesWithMissingBds++;
@@ -814,7 +909,7 @@ async function migrateBDS(projectInfo) {
     const migResult = migrateTsFile(
       tsFile,
       fs.existsSync(htmlFile) ? htmlFile : null,
-      projectSelectorIndex
+      projectIndex
     );
     if (!migResult) { skipped++; continue; }
 
@@ -823,7 +918,9 @@ async function migrateBDS(projectInfo) {
     if (migResult.legacyModules.length)  migResult.legacyModules.forEach(m => print('    ' + dim('✖ módulo legacy eliminado: ' + m)));
     if (migResult.bdsAdded.length)       migResult.bdsAdded.forEach(s  => print('    ' + ok('BDS standalone agregado: ' + s)));
     if (migResult.internalAdded.length)  migResult.internalAdded.forEach(s => print('    ' + ok('Componente interno agregado: ' + s)));
-    if (migResult.angularAdded && migResult.angularAdded.length) migResult.angularAdded.forEach(s => print('    ' + ok('Angular agregado a imports[]: ' + s)));
+    if (migResult.angularAdded && migResult.angularAdded.length)   migResult.angularAdded.forEach(s  => print('    ' + ok('Angular agregado: ' + s)));
+    if (migResult.pipesAdded && migResult.pipesAdded.length)       migResult.pipesAdded.forEach(s    => print('    ' + ok('Pipe propio agregado: ' + s)));
+    if (migResult.bdsFromTsAdded && migResult.bdsFromTsAdded.length) migResult.bdsFromTsAdded.forEach(s => print('    ' + ok('BDS desde TS: ' + s)));
 
     if (!isDry) {
       fs.writeFileSync(tsFile, migResult.result, 'utf-8');
