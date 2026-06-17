@@ -624,6 +624,598 @@ async function migrateControlFlow() {
   print('\n' + ok('Migración control flow completada ✓'));
 }
 
+// ─── ELIMINAR CORE-UTILS-WIDGETS-WEB ────────────────────────
+/**
+ * Reemplaza todos los usos de @bancolombia/core-utils-widgets-web siguiendo
+ * el patrón de registered-accounts-widget (que ya NO usa la librería):
+ *
+ *  IWidgetConfigurationModel  → interface local ICoreWidgetConfig
+ *  IInfrastructureMappingModel → ClassProvider[] de Angular (provide/useClass)
+ *  IBaseUsecase<T>            → se elimina el implements, queda solo el método invoke()
+ *  BaseService (gateway)      → abstract class sin herencia, sin constructor extra
+ *  HTTP_METHODS               → strings literales 'GET','POST','PUT','DELETE','PATCH'
+ *  Identifier('Name')         → decorator eliminado; acceso a endpoints por tipo directo
+ *  IEndpointsModel / @Inject  → inject(TOKEN) con tipo propio tipado
+ *  baseRequest(...)           → HttpClient.get/post/put/delete directos con HttpHeaders
+ *  IBaseMapper<T>             → interface local IMapper<T> con fromMap()
+ */
+
+// Interfaces locales que se inyectan en cada archivo que las necesita
+const LOCAL_WIDGET_CONFIG_INTERFACE = `
+export interface ICoreWidgetConfig {
+  infrastructures?: import('@angular/core').ClassProvider[];
+  endpoints?: Record<string, Record<string, string>>;
+  operationIds?: Record<string, Record<string, string>>;
+  labels?: Record<string, unknown>;
+}
+`.trim();
+
+const LOCAL_MAPPER_INTERFACE = `
+export interface IMapper<T> {
+  fromMap(response: { meta: unknown; data: T }): T;
+}
+`.trim();
+
+/** Extrae qué symbols importa de core-utils en una línea de import */
+function extractCoreUtilsSymbols(content) {
+  const symbols = new Set();
+  const re = /import\s*\{([^}]+)\}\s*from\s*['"]@bancolombia\/core-utils-widgets-web['"]/g;
+  let m;
+  while ((m = re.exec(content)) !== null) {
+    m[1].split(',').map(s => s.trim()).filter(Boolean).forEach(s => symbols.add(s));
+  }
+  return symbols;
+}
+
+/** Elimina todas las líneas de import de core-utils */
+function removeCoreUtilsImports(content) {
+  return content.replace(
+    /import\s*\{[^}]+\}\s*from\s*['"]@bancolombia\/core-utils-widgets-web['"];?\r?\n?/g,
+    ''
+  );
+}
+
+/**
+ * Transforma un gateway que extiende BaseService a abstract class pura.
+ * Antes: export abstract class XGateway extends BaseService { ... }
+ * Después: export abstract class XGateway { ... }
+ * También elimina el constructor super(http) si existe.
+ */
+function transformGateway(content, symbols) {
+  if (!symbols.has('BaseService')) return content;
+  let r = content;
+  // Quitar "extends BaseService"
+  r = r.replace(/\bextends\s+BaseService\b/g, '');
+  // Quitar constructor que sólo llama super(http)
+  r = r.replace(/constructor\s*\(\s*(?:public\s+)?(?:http(?:Client)?:\s*HttpClient)?\s*\)\s*\{\s*super\s*\([^)]*\)\s*;?\s*\}/g, '');
+  // Quitar importación de HttpClient si ya no se usa (se evaluará al final)
+  return r;
+}
+
+/**
+ * Transforma un driven-adapter que extiende un gateway con BaseService.
+ * Reemplaza baseRequest() por llamadas HttpClient directas.
+ * Quita @Identifier, quita this.identifier, quita IEndpointsModel/@Inject.
+ */
+function transformDrivenAdapter(content, symbols) {
+  if (!symbols.has('HTTP_METHODS') && !symbols.has('Identifier') && !symbols.has('IEndpointsModel')) {
+    return content;
+  }
+  let r = content;
+
+  // Quitar decorator @Identifier('...')
+  r = r.replace(/@Identifier\s*\(\s*['"][^'"]+['"]\s*\)\s*\n?/g, '');
+
+  // Quitar import de @Inject si viene solo de core-utils (se quitará con removeCoreUtilsImports)
+  // Quitar @Inject en parámetros del constructor → usar inject()
+  // Reemplazar el constructor completo que usa @Inject(ENDPOINTS_CONFIG) por inject()
+  // Patrón: constructor(public http: HttpClient, @Inject(X) private a: T, @Inject(Y) private b: T) { super(http); }
+  r = r.replace(
+    /constructor\s*\(\s*public\s+(http(?:Client)?):\s*HttpClient\s*,\s*@Inject\(ENDPOINTS_CONFIG\)\s*private\s+(\w+):\s*\w+\s*,\s*@Inject\(OPERATION_IDS_CONFIG\)\s*private\s+(\w+):\s*\w+\s*\)\s*\{\s*super\s*\([^)]*\)\s*;?\s*\}/g,
+    (_, httpName, endpointsName, opsName) =>
+      `private readonly ${httpName} = inject(HttpClient);\n  private readonly ${endpointsName} = inject(ENDPOINTS_CONFIG);\n  private readonly ${opsName} = inject(OPERATION_IDS_CONFIG);`
+  );
+
+  // Reemplazar acceso this.endpoints[this.identifier][Key] → this.endpoints.ServiceName[Key]
+  // No podemos saber el nombre del servicio sin más contexto, dejamos un TODO claro
+  r = r.replace(/this\.endpoints\[this\.identifier\]\[([^\]]+)\]/g, 'this.endpoints[$1]');
+  r = r.replace(/this\.operationIds(?:Config)?\[this\.identifier\]\[([^\]]+)\]/g, 'this.operationIds[$1]');
+  r = r.replace(/this\.operationIds\[this\.identifier\]\[([^\]]+)\]/g, 'this.operationIds[$1]');
+
+  // Reemplazar this.baseRequest<T>(path, HTTP_METHODS.GET, ...) → this.http.get<T>(path, { headers })
+  // Patrón general de baseRequest con HTTP_METHODS
+  r = r.replace(
+    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.GET,\s*(?:null|undefined),\s*\{\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
+    (_, T, path, headers) =>
+      `this.http.get<${T}>(${path.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
+  );
+  r = r.replace(
+    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.POST,\s*(?:null|undefined),\s*\{\s*body:\s*([^,}]+),?\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
+    (_, T, path, body, headers) =>
+      `this.http.post<${T}>(${path.trim()}, ${body.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
+  );
+  r = r.replace(
+    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*'PUT',\s*(?:null|undefined),\s*\{\s*body:\s*([^,}]+),?\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
+    (_, T, path, body, headers) =>
+      `this.http.put<${T}>(${path.trim()}, ${body.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
+  );
+  r = r.replace(
+    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.DELETE,\s*(?:null|undefined),\s*\{\s*headers:\s*([^,}]+),?\s*params:\s*(\{[^}]+\})\s*\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
+    (_, T, path, headers, params) =>
+      `this.http.delete<${T}>(${path.trim()}, { headers: new HttpHeaders(${headers.trim()}), params: ${params.trim()} })`
+  );
+  // Fallback: cualquier baseRequest que quede, marcarlo con TODO
+  r = r.replace(/this\.baseRequest</g, '/* TODO: reemplazar baseRequest */ this.http.request<');
+
+  // Quitar HTTP_METHODS que queden huérfanos (ya no se usan)
+  r = r.replace(/HTTP_METHODS\.\w+/g, m => {
+    const map = { 'HTTP_METHODS.GET':'\'GET\'','HTTP_METHODS.POST':'\'POST\'','HTTP_METHODS.PUT':'\'PUT\'','HTTP_METHODS.DELETE':'\'DELETE\'','HTTP_METHODS.PATCH':'\'PATCH\'' };
+    return map[m] || m;
+  });
+
+  // Agregar inject import si no existe
+  if (!/inject\s*,/.test(r) && !/, inject/.test(r) && /inject\(/.test(r)) {
+    r = r.replace(
+      /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/core['"]/,
+      (_, inner) => `import { ${inner.trim()}, inject } from '@angular/core'`
+    );
+  }
+  // Agregar HttpHeaders si no existe y se necesita
+  if (/HttpHeaders/.test(r) && !/HttpHeaders/.test(r.split('from')[0])) {
+    r = r.replace(
+      /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/common\/http['"]/,
+      (_, inner) => {
+        const parts = inner.split(',').map(s=>s.trim());
+        if (!parts.includes('HttpHeaders')) parts.push('HttpHeaders');
+        return `import { ${parts.join(', ')} } from '@angular/common/http'`;
+      }
+    );
+  }
+
+  return r;
+}
+
+/**
+ * Transforma la configuration.ts que usa IWidgetConfigurationModel e IInfrastructureMappingModel.
+ * Reemplaza la interface extendida por una local con la misma forma.
+ * El bucle for..of para construir infrastructures[] se reemplaza por un map() directo.
+ */
+function transformConfiguration(content, symbols) {
+  if (!symbols.has('IWidgetConfigurationModel') && !symbols.has('IInfrastructureMappingModel')) {
+    return content;
+  }
+  let r = content;
+
+  // Reemplazar "extends IWidgetConfigurationModel" por la interface local inline
+  r = r.replace(/\bextends\s+IWidgetConfigurationModel\b/g, '');
+
+  // Quitar "as IInfrastructureMappingModel[]" cast
+  r = r.replace(/\s*as\s+IInfrastructureMappingModel\[\]/g, '');
+
+  // Reemplazar el bloque for..of que construye infrastructures por un .map() limpio
+  r = r.replace(
+    /const infrastructures\s*=\s*\[\s*\];\s*for\s*\(const item of DEFAULT_CONFIGURATION\.infrastructures[^)]*\)\s*\{[^}]*infrastructures\.push\(\{[^}]*provide:\s*item\.gateway,\s*useClass:\s*item\.implementation[^}]*\}\s*\);\s*\}/g,
+    `const infrastructures = (DEFAULT_CONFIGURATION.infrastructures || []).map(item => ({\n  provide: item.gateway,\n  useClass: item.implementation,\n}));`
+  );
+
+  // Reemplazar IWidgetConfigurationModel en el tipo de la interface extendida
+  // Si la interface local del proyecto extiende IWidgetConfigurationModel, la dejamos como standalone
+  r = r.replace(/\bIWidgetConfigurationModel\b/g, 'ICoreWidgetConfig');
+  r = r.replace(/\bIInfrastructureMappingModel\b/g, '{ gateway: any; implementation: any }');
+
+  // Agregar la interface local al inicio del archivo (después de los imports)
+  const localInterface = `\n// ─── Interface local (reemplaza IWidgetConfigurationModel de core-utils) ───\nexport interface ICoreWidgetConfig {\n  infrastructures?: { gateway: any; implementation: any }[];\n  endpoints?: Record<string, Record<string, string>>;\n  operationIds?: Record<string, Record<string, string>>;\n  labels?: Record<string, unknown>;\n}\n`;
+  const lastImportIdx = r.lastIndexOf('\nimport ');
+  const afterLastImport = r.indexOf('\n', lastImportIdx + 1);
+  if (lastImportIdx >= 0 && afterLastImport >= 0) {
+    r = r.slice(0, afterLastImport + 1) + localInterface + r.slice(afterLastImport + 1);
+  }
+
+  return r;
+}
+
+/**
+ * Transforma un usecase que implementa IBaseUsecase<T>.
+ * Antes: export class XUseCase implements IBaseUsecase<T> { ... }
+ * Después: export class XUseCase { ... }  (TypeScript infiere la forma)
+ */
+function transformUsecase(content, symbols) {
+  if (!symbols.has('IBaseUsecase')) return content;
+  return content.replace(/\s*implements\s+IBaseUsecase<[^>]+>/g, '');
+}
+
+/**
+ * Transforma un mapper que implementa IBaseMapper<T>.
+ * Reemplaza la interface importada por una local.
+ */
+function transformMapper(content, symbols) {
+  if (!symbols.has('IBaseMapper')) return content;
+  let r = content;
+  r = r.replace(/\bimplements\s+IBaseMapper<([^>]+)>/g, 'implements IMapper<$1>');
+  r = r.replace(/\bIBaseMapper\b/g, 'IMapper');
+  // Agregar interface local
+  const localIface = `\nexport interface IMapper<T> { fromMap(response: { meta: unknown; data: T }): T; }\n`;
+  r = localIface + r;
+  return r;
+}
+
+async function removeCoreUtils() {
+  print(title('ELIMINAR @bancolombia/core-utils-widgets-web'));
+
+  // Verificar que existe en el proyecto
+  const pkgPath = path.join(projectPath, 'package.json');
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  const hasDep = !!(
+    (pkg.dependencies || {})['@bancolombia/core-utils-widgets-web'] ||
+    (pkg.devDependencies || {})['@bancolombia/core-utils-widgets-web']
+  );
+
+  if (!hasDep) {
+    print(ok('@bancolombia/core-utils-widgets-web NO está en package.json. Nada que hacer.'));
+    // Igual buscamos imports residuales en el código
+  }
+
+  // Escanear archivos
+  const tsFiles = getAllFiles(path.join(projectPath, 'src'), '.ts')
+    .concat(getAllFiles(path.join(projectPath, 'projects'), '.ts'));
+
+  const affected = tsFiles.filter(f => {
+    try { return fs.readFileSync(f, 'utf-8').includes('@bancolombia/core-utils-widgets-web'); }
+    catch { return false; }
+  });
+
+  if (affected.length === 0 && !hasDep) {
+    print(ok('No se encontraron referencias a core-utils-widgets-web. Proyecto limpio.')); return;
+  }
+
+  print(info(`Archivos con referencias a core-utils: ${affected.length}`));
+  affected.forEach(f => print(`  ${C.dim}· ${path.relative(projectPath, f)}${C.reset}`));
+
+  const dryRun = await prompt('\n  ¿Ejecutar en modo dry-run (solo muestra cambios sin guardar)? (s/n): ');
+  const isDry  = dryRun.toLowerCase() === 's';
+
+  const confirm = await prompt(`  ¿${isDry ? 'Analizar' : 'Aplicar'} eliminación de core-utils? (s/n): `);
+  if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+
+  let changed = 0;
+  const report = [];
+
+  for (const filePath of affected) {
+    const original = fs.readFileSync(filePath, 'utf-8');
+    const symbols  = extractCoreUtilsSymbols(original);
+    const rel      = path.relative(projectPath, filePath);
+
+    print(`\n  ${C.cyan}→${C.reset} ${rel}`);
+    print(`    Symbols: ${[...symbols].join(', ')}`);
+
+    let result = original;
+
+    // Aplicar transformaciones según los symbols detectados
+    result = transformGateway(result, symbols);
+    result = transformDrivenAdapter(result, symbols);
+    result = transformConfiguration(result, symbols);
+    result = transformUsecase(result, symbols);
+    result = transformMapper(result, symbols);
+
+    // Eliminar la línea de import de core-utils
+    result = removeCoreUtilsImports(result);
+
+    // Limpiar líneas en blanco triples
+    result = result.replace(/\n{3,}/g, '\n\n');
+
+    const linesChanged = original.split('\n').length - result.split('\n').length;
+    report.push({ rel, symbols: [...symbols], linesChanged });
+
+    if (!isDry) {
+      fs.writeFileSync(filePath, result, 'utf-8');
+      print(`    ${ok('guardado')}`);
+    } else {
+      print(`    ${dim('[dry-run: no se guardó]')}`);
+    }
+    changed++;
+  }
+
+  // Actualizar package.json
+  if (!isDry && hasDep) {
+    print(step('Eliminando de package.json...'));
+    if (pkg.dependencies) delete pkg.dependencies['@bancolombia/core-utils-widgets-web'];
+    if (pkg.devDependencies) delete pkg.devDependencies['@bancolombia/core-utils-widgets-web'];
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
+    print(ok('Eliminado de package.json'));
+    print(info('Ejecuta: npm install --legacy-peer-deps  para sincronizar node_modules'));
+  }
+
+  separator();
+  print(ok(`core-utils: ${changed} archivos ${isDry ? 'analizados' : 'transformados'}.`));
+
+  if (!isDry) {
+    print(warn('\nRevisión manual recomendada:'));
+    print(dim('  · Verifica que los driven-adapters compilen (especialmente los baseRequest reemplazados)'));
+    print(dim('  · Ajusta el acceso a endpoints si usaba this.identifier (marcado con TODO)'));
+    print(dim('  · Ejecuta npm run build para verificar'));
+  }
+}
+
+// ─── REESTRUCTURA DE CARPETAS ────────────────────────────────
+/**
+ * Migra la estructura de carpetas al patrón de registered-accounts-widget:
+ *
+ * Estructura ORIGEN (antigua):
+ *   projects/<widget>/src/lib/
+ *     domain/models/...
+ *     domain/usecases/...
+ *     infraestructure/driven-adapter/...   ← typo "infraestructure" incluido
+ *     infrastructure/driven-adpaters/...   ← otro typo posible
+ *     ui/pages/...
+ *     ui/view-models/...
+ *     mocks/...
+ *     utils/...
+ *
+ * Estructura DESTINO (patrón registered-accounts):
+ *   projects/<widget>/src/lib/
+ *     features/
+ *       <feature-name>/
+ *         application/
+ *           domain/
+ *           infrastructure/   ← nombre correcto
+ *           ui/
+ *         testing/
+ *           mock/
+ *
+ * Los archivos raíz (configuration.ts, routes.ts, tokens.ts, .ts principal)
+ * se quedan en src/lib/ sin moverse.
+ */
+
+function getFeatureName(widgetDir) {
+  // Deriva el nombre del feature del nombre de la librería en ng-package.json o del directorio
+  const ngPkg = path.join(widgetDir, 'ng-package.json');
+  if (fs.existsSync(ngPkg)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(ngPkg, 'utf-8'));
+      if (pkg.lib && pkg.lib.entryFile) {
+        // e.g. src/lib/manage-massive-campaigns-widget.ts → manage-massive-campaigns
+        const base = path.basename(pkg.lib.entryFile, '.ts').replace(/-widget$/, '');
+        return base;
+      }
+    } catch {}
+  }
+  return path.basename(widgetDir).replace(/-widget$/, '');
+}
+
+function buildFolderMapping(libDir, featureName) {
+  /**
+   * Retorna un array de { from: absolutePath, to: absolutePath }
+   * para cada archivo que debe moverse.
+   * Los archivos raíz (*.config.ts, *.routes.ts, *.tokens.ts, *.ts, injection.constants.ts)
+   * quedan en libDir y no se mueven.
+   */
+  const ROOT_FILES_RE = /\.(config|routes|tokens|module|constants)\.ts$|^[^/]+\.ts$/;
+  const appBase = path.join(libDir, 'features', featureName, 'application');
+  const testBase = path.join(libDir, 'features', featureName, 'testing');
+
+  const DIR_MAP = [
+    // domain
+    { from: path.join(libDir, 'domain'),         to: path.join(appBase, 'domain') },
+    // infraestructure (typo original) → infrastructure
+    { from: path.join(libDir, 'infraestructure'), to: path.join(appBase, 'infrastructure') },
+    // infrastructure (typo alternativo driven-adpaters)
+    { from: path.join(libDir, 'infrastructure'),  to: path.join(appBase, 'infrastructure') },
+    // ui
+    { from: path.join(libDir, 'ui'),              to: path.join(appBase, 'ui') },
+    // mocks → testing/mock
+    { from: path.join(libDir, 'mocks'),           to: path.join(testBase, 'mock') },
+    // utils → application/ui/utils (o infrastructure/utils según contenido; va a ui/utils por defecto)
+    { from: path.join(libDir, 'utils'),           to: path.join(appBase, 'ui', 'utils') },
+  ];
+
+  const mappings = []; // { fromAbs, toAbs }
+
+  for (const { from, to } of DIR_MAP) {
+    if (!fs.existsSync(from)) continue;
+    const files = getAllFiles(from, '.ts').concat(
+      getAllFiles(from, '.html'),
+      getAllFiles(from, '.scss'),
+      getAllFiles(from, '.spec.ts'),
+    );
+    for (const f of files) {
+      const rel    = path.relative(from, f);
+      const toAbs  = path.join(to, rel);
+      mappings.push({ fromAbs: f, toAbs });
+    }
+  }
+
+  // Deduplicar por fromAbs
+  const seen = new Set();
+  return mappings.filter(m => {
+    if (seen.has(m.fromAbs)) return false;
+    seen.add(m.fromAbs);
+    return true;
+  });
+}
+
+/**
+ * Recalcula un import relativo desde newFilePath hacia targetAbs.
+ * Si el import NO era relativo (empieza con @), lo deja igual.
+ */
+function recalcRelativeImport(oldFilePath, newFilePath, importStr, allMappings) {
+  if (!importStr.startsWith('.')) return importStr; // absoluto, no tocar
+
+  // Resolver la ruta absoluta que apunta el import original
+  const oldDir     = path.dirname(oldFilePath);
+  const targetAbs  = path.resolve(oldDir, importStr);
+
+  // ¿Se movió ese archivo también?
+  const mapping    = allMappings.find(m => m.fromAbs === targetAbs || m.fromAbs === targetAbs + '.ts');
+  const finalTarget = mapping ? mapping.toAbs.replace(/\.ts$/, '') : targetAbs;
+
+  // Calcular nuevo relativo desde newFilePath
+  const newDir     = path.dirname(newFilePath);
+  let newRel       = path.relative(newDir, finalTarget).replace(/\\/g, '/');
+  if (!newRel.startsWith('.')) newRel = './' + newRel;
+  return newRel;
+}
+
+/**
+ * Actualiza los imports dentro de un archivo .ts después de moverlo.
+ */
+function updateImportsInFile(content, oldFilePath, newFilePath, allMappings) {
+  return content.replace(
+    /from\s*['"]([^'"]+)['"]/g,
+    (match, importPath) => {
+      const newPath = recalcRelativeImport(oldFilePath, newFilePath, importPath, allMappings);
+      return `from '${newPath}'`;
+    }
+  );
+}
+
+async function restructureFolders() {
+  print(title('REESTRUCTURA DE CARPETAS'));
+  print(info('Migra al patrón: features/<nombre>/application/{domain,infrastructure,ui}/'));
+  print(warn('Solo mueve los archivos de projects/<widget>/src/lib/ — los archivos raíz quedan igual.\n'));
+
+  // Encontrar directorios de widget dentro de projects/
+  const projectsDir = path.join(projectPath, 'projects');
+  if (!fs.existsSync(projectsDir)) {
+    print(err('No existe la carpeta projects/ en este proyecto.')); return;
+  }
+
+  const widgetDirs = fs.readdirSync(projectsDir, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => path.join(projectsDir, d.name));
+
+  if (widgetDirs.length === 0) {
+    print(err('No se encontraron subdirectorios en projects/.')); return;
+  }
+
+  // Seleccionar widget si hay más de uno
+  let widgetDir = widgetDirs[0];
+  if (widgetDirs.length > 1) {
+    print('  Widgets encontrados:');
+    widgetDirs.forEach((d, i) => print(`  ${C.cyan}${i + 1}${C.reset}  ${path.basename(d)}`));
+    const sel = await prompt('  Elige número: ');
+    const idx = parseInt(sel) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= widgetDirs.length) {
+      print(warn('Selección inválida.')); return;
+    }
+    widgetDir = widgetDirs[idx];
+  }
+
+  const libDir     = path.join(widgetDir, 'src', 'lib');
+  const featureName = getFeatureName(widgetDir);
+
+  print(info(`Widget   : ${path.basename(widgetDir)}`));
+  print(info(`Feature  : ${featureName}`));
+  print(info(`Lib dir  : ${libDir}\n`));
+
+  if (!fs.existsSync(libDir)) {
+    print(err(`No existe: ${libDir}`)); return;
+  }
+
+  // ¿Ya está migrado?
+  const featuresDir = path.join(libDir, 'features');
+  if (fs.existsSync(featuresDir)) {
+    print(warn('La carpeta features/ ya existe. ¿Puede que ya esté migrado o parcialmente migrado.'));
+    const cont = await prompt('  ¿Continuar de todas formas? (s/n): ');
+    if (cont.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+  }
+
+  const mappings = buildFolderMapping(libDir, featureName);
+
+  if (mappings.length === 0) {
+    print(warn('No se encontraron archivos para mover. Revisa que la estructura sea la esperada.')); return;
+  }
+
+  // Mostrar resumen
+  print(`  Archivos a mover: ${C.bold}${mappings.length}${C.reset}\n`);
+  const MAX_SHOW = 30;
+  mappings.slice(0, MAX_SHOW).forEach(m => {
+    const from = path.relative(libDir, m.fromAbs);
+    const to   = path.relative(libDir, m.toAbs);
+    print(`  ${C.dim}${from}${C.reset}`);
+    print(`    ${C.green}→${C.reset} ${to}`);
+  });
+  if (mappings.length > MAX_SHOW) {
+    print(dim(`  ... y ${mappings.length - MAX_SHOW} archivos más`));
+  }
+
+  print('');
+  const dryRun = await prompt('  ¿Ejecutar en modo dry-run (solo muestra sin mover)? (s/n): ');
+  const isDry  = dryRun.toLowerCase() === 's';
+
+  if (isDry) {
+    print(info('\nDry-run: ningún archivo fue movido.'));
+    print(info('Ejecuta de nuevo sin dry-run para aplicar.'));
+    return;
+  }
+
+  const confirm = await prompt('  ¿Confirmar reestructura de carpetas? (s/n): ');
+  if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+
+  // Mover archivos
+  let moved = 0, failed = 0;
+
+  for (const { fromAbs, toAbs } of mappings) {
+    try {
+      // Leer contenido y actualizar imports
+      const original = fs.readFileSync(fromAbs, 'utf-8');
+      const updated  = fromAbs.endsWith('.ts')
+        ? updateImportsInFile(original, fromAbs, toAbs, mappings)
+        : original;
+
+      // Crear directorio destino si no existe
+      fs.mkdirSync(path.dirname(toAbs), { recursive: true });
+
+      // Escribir en destino
+      fs.writeFileSync(toAbs, updated, 'utf-8');
+
+      // Eliminar origen
+      fs.unlinkSync(fromAbs);
+
+      moved++;
+    } catch (e) {
+      print(err(`  Error moviendo ${path.relative(libDir, fromAbs)}: ${e.message}`));
+      failed++;
+    }
+  }
+
+  // Limpiar directorios vacíos que quedaron
+  const oldDirs = ['domain', 'infraestructure', 'infrastructure', 'ui', 'mocks', 'utils'];
+  for (const d of oldDirs) {
+    const dirPath = path.join(libDir, d);
+    if (fs.existsSync(dirPath)) {
+      try {
+        // Solo elimina si está vacío (rmdir falla si no lo está)
+        fs.rmdirSync(dirPath, { recursive: true });
+        print(dim(`  Carpeta eliminada: ${d}/`));
+      } catch {}
+    }
+  }
+
+  // Actualizar public-api.ts si existe
+  const publicApi = path.join(widgetDir, 'src', 'public-api.ts');
+  if (fs.existsSync(publicApi)) {
+    print(step('Actualizando public-api.ts...'));
+    const content = fs.readFileSync(publicApi, 'utf-8');
+    // Re-calcular exports relativos que apuntaban a las rutas viejas
+    const updated = content.replace(
+      /export\s*\*\s*from\s*['"]([^'"]+)['"]/g,
+      (match, importPath) => {
+        const newPath = recalcRelativeImport(publicApi, publicApi, importPath, mappings);
+        return `export * from '${newPath}'`;
+      }
+    );
+    fs.writeFileSync(publicApi, updated, 'utf-8');
+    print(ok('public-api.ts actualizado'));
+  }
+
+  separator();
+  print(ok(`Reestructura completada: ${moved} archivos movidos${failed > 0 ? `, ${failed} errores` : ''}.`));
+  print(warn('\nPróximos pasos recomendados:'));
+  print(dim('  1. Ejecuta npm run build para verificar que compila'));
+  print(dim('  2. Revisa los imports en archivos que NO estaban en src/lib/ (ej: src/app/*)'));
+  print(dim('  3. Actualiza tsconfig paths si tienes aliases definidos'));
+}
+
 // ─── MIGRACIÓN COMPLETA ─────────────────────────────────────
 async function runFullMigration(info) {
   print(title('MIGRACIÓN COMPLETA'));
@@ -661,6 +1253,8 @@ async function showMenu(info) {
   print(`  ${C.cyan}5${C.reset}  Migrar Control Flow (@if/@for)`);
   print(`  ${C.cyan}6${C.reset}  Migración completa (todo en orden)`);
   print(`  ${C.cyan}7${C.reset}  Cambiar proyecto`);
+  print(`  ${C.cyan}8${C.reset}  Eliminar @bancolombia/core-utils-widgets-web`);
+  print(`  ${C.cyan}9${C.reset}  Reestructura de carpetas (patrón registered-accounts)`);
   print(`  ${C.red}0${C.reset}  Salir\n`);
 
   const choice = await prompt(`  → `);
@@ -710,6 +1304,8 @@ async function main() {
         case '4': await migrateStandalone(); break;
         case '5': await migrateControlFlow(); break;
         case '6': await runFullMigration(detected); break;
+        case '8': await removeCoreUtils(); break;
+        case '9': await restructureFolders(); break;
         case '7':
           const logFile = saveLog();
           print(ok(`Log guardado en: ${logFile}`));
@@ -720,7 +1316,7 @@ async function main() {
           print('\nHasta pronto 👋\n');
           process.exit(0);
         default:
-          print(warn('Opción inválida. Elige entre 0 y 7.'));
+          print(warn('Opción inválida. Elige entre 0 y 9.'));
       }
 
       await prompt('\n  Presiona Enter para volver al menú...');
