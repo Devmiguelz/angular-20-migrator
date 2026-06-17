@@ -248,23 +248,23 @@ function checkNgCli() {
 }
 
 // ─── DIAGNÓSTICO ────────────────────────────────────────────
-async function runDiagnostic(info) {
+async function runDiagnostic(projectInfo) {
   print(title('DIAGNÓSTICO DEL PROYECTO'));
 
   // Angular
-  if (info.angularVer) {
-    const badge = info.angularVer >= 20 ? ok(`Angular ${info.angularVer} (última)`) :
-                  info.angularVer >= 17 ? warn(`Angular ${info.angularVer} (actualizable a 20)`) :
-                  err(`Angular ${info.angularVer} (requiere migración)`);
+  if (projectInfo.angularVer) {
+    const badge = projectInfo.angularVer >= 20 ? ok(`Angular ${projectInfo.angularVer} (última)`) :
+                  projectInfo.angularVer >= 17 ? warn(`Angular ${projectInfo.angularVer} (actualizable a 20)`) :
+                  err(`Angular ${projectInfo.angularVer} (requiere migración)`);
     print(`  ${badge}`);
   } else {
     print(`  ${err('No se detectó @angular/core')}`);
   }
 
   // BDS
-  if (info.bdsVer) {
-    const bdsBadge = info.bdsVer >= 16 ? ok(`BDS v${info.bdsVer} (standalone compatible)`) :
-                     warn(`BDS v${info.bdsVer} → migrar a standalone`);
+  if (projectInfo.bdsVer) {
+    const bdsBadge = projectInfo.bdsVer >= 16 ? ok(`BDS v${projectInfo.bdsVer} (standalone compatible)`) :
+                     warn(`BDS v${projectInfo.bdsVer} → migrar a standalone`);
     print(`  ${bdsBadge}`);
   } else {
     print(`  ${dim('BDS: no detectado')}`);
@@ -329,14 +329,14 @@ async function runDiagnostic(info) {
 }
 
 // ─── MIGRACIÓN ANGULAR ──────────────────────────────────────
-async function migrateAngular(info) {
+async function migrateAngular(projectInfo) {
   print(title('MIGRACIÓN ANGULAR'));
 
-  if (!info.angularVer) {
+  if (!projectInfo.angularVer) {
     print(err('No se detectó versión de Angular.')); return;
   }
 
-  const current = info.angularVer;
+  const current = projectInfo.angularVer;
   const target  = 20;
 
   if (current >= target) {
@@ -473,7 +473,7 @@ function migrateTsFile(filePath, htmlPath) {
   return { result, detected: [...detected] };
 }
 
-async function migrateBDS(info) {
+async function migrateBDS(projectInfo) {
   print(title('MIGRACIÓN BDS (módulos → standalone)'));
 
   const bdsModules = detectBdsModules();
@@ -1221,7 +1221,7 @@ async function restructureFolders() {
 }
 
 // ─── MIGRACIÓN COMPLETA ─────────────────────────────────────
-async function runFullMigration(info) {
+async function runFullMigration(projectInfo) {
   print(title('MIGRACIÓN COMPLETA'));
   print(warn('Ejecutará en orden: Angular → BDS → Standalone → Control Flow\n'));
 
@@ -1754,9 +1754,9 @@ async function migrateMicrofrontend() {
 }
 
 // ─── MENÚ PRINCIPAL ─────────────────────────────────────────
-async function showMenu(info) {
-  const angVer = info.angularVer || '?';
-  const bdVer  = info.bdsVer  || '?';
+async function showMenu(projectInfo) {
+  const angVer = projectInfo.angularVer || '?';
+  const bdVer  = projectInfo.bdsVer  || '?';
 
   print(`\n${C.bold}${C.cyan}Proyecto:${C.reset} ${projectPath}`);
   print(`${C.bold}${C.cyan}Angular: ${C.reset}${angVer}   ${C.bold}${C.cyan}BDS: ${C.reset}${bdVer}\n`);
