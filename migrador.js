@@ -652,26 +652,53 @@ function migrateTsFile(filePath, htmlPath, projectSelectorIndex) {
       : newInternalLines + '\n' + result;
   }
 
-  // ── 9. Actualizar bloque imports: [...] ───────────────────────────────
-  result = result.replace(/imports\s*:\s*\[([^\]]*)\]/s, (_, inner) => {
-    let cleaned = inner;
-    for (const modName of legacyModulesFound) {
-      cleaned = cleaned.replace(
-        new RegExp('\\b' + modName + '\\s*\\.forRoot\\s*\\((?:[^)(]|\\([^)]*\\))*\\)\\s*,?\\s*', 'gs'), ''
+  // ── 9. Actualizar o CREAR bloque imports: [...] dentro de @Component ──
+  const allBdsNew      = [...new Set([...bdsToAdd.values()].flatMap(s => [...s]))];
+  const allInternalNew = internalToAdd.map(e => e.className);
+
+  const hasImportsBlock = /imports\s*:\s*\[/s.test(result);
+
+  if (hasImportsBlock) {
+    result = result.replace(/imports\s*:\s*\[([^\]]*)\]/s, (_, inner) => {
+      let cleaned = inner;
+      for (const modName of legacyModulesFound) {
+        cleaned = cleaned.replace(
+          new RegExp('\\b' + modName + '\\s*\\.forRoot\\s*\\((?:[^)(]|\\([^)]*\\))*\\)\\s*,?\\s*', 'gs'), ''
+        );
+        cleaned = cleaned.replace(new RegExp('\\b' + modName + '\\b,?\\s*', 'g'), '');
+      }
+      const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
+        s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
       );
-      cleaned = cleaned.replace(new RegExp('\\b' + modName + '\\b,?\\s*', 'g'), '');
+      const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
+      const fmt = combined.length > 3
+        ? '\n        ' + combined.join(',\n        ') + ',\n    '
+        : combined.join(', ');
+      return 'imports: [' + fmt + ']';
+    });
+  } else {
+    // NO existe imports: [] — crearlo dentro del @Component({})
+    const combined = [...new Set([...allBdsNew, ...allInternalNew])].filter(Boolean);
+    if (combined.length > 0) {
+      const fmt = combined.length > 3
+        ? '\n        ' + combined.join(',\n        ') + ',\n    '
+        : ' ' + combined.join(', ') + ' ';
+      const importsBlock = '\n    imports: [' + fmt + '],';
+      if (/standalone\s*:\s*true/.test(result)) {
+        // Insertar justo después de standalone: true,
+        result = result.replace(
+          /(standalone\s*:\s*true),?/,
+          '$1,' + importsBlock
+        );
+      } else {
+        // Insertar antes del cierre }) del decorador @Component
+        result = result.replace(
+          /(@Component\s*\(\s*\{)([\s\S]*?)(\n\s*\}\s*\))/,
+          (_, open, body, close) => open + body.trimEnd() + importsBlock + close
+        );
+      }
     }
-    const existingNames = cleaned.split(',').map(s => s.trim()).filter(s =>
-      s && !BDS_MODULE_TO_STANDALONE[s.replace(/\.forRoot\(.*\)/s, '').trim()]
-    );
-    const allBdsNew      = [...new Set([...bdsToAdd.values()].flatMap(s => [...s]))];
-    const allInternalNew = internalToAdd.map(e => e.className);
-    const combined = [...new Set([...existingNames, ...allBdsNew, ...allInternalNew])].filter(Boolean);
-    const fmt = combined.length > 3
-      ? '\n        ' + combined.join(',\n        ') + ',\n    '
-      : combined.join(', ');
-    return 'imports: [' + fmt + ']';
-  });
+  }
 
   result = result.replace(/\n{3,}/g, '\n\n');
 
