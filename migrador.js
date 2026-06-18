@@ -1012,6 +1012,522 @@ async function convertStandaloneFlag() {
   }
 }
 
+// ─── GENERAR ARCHIVOS STANDALONE DEL WIDGET ─────────────────
+/**
+ * Utilidades de naming: convierte kebab-case a PascalCase y SCREAMING_SNAKE_CASE
+ * manage-massive-campaigns-widget → ManageMassiveCampaigns / MANAGE_MASSIVE_CAMPAIGNS
+ */
+function widgetNameToPascal(widgetName) {
+  // manage-massive-campaigns-widget → ManageMassiveCampaignsWidget
+  return widgetName
+    .split('-')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join('');
+}
+
+function widgetNameToScreamingSnake(widgetName) {
+  // manage-massive-campaigns-widget → MANAGE_MASSIVE_CAMPAIGNS_WIDGET
+  return widgetName.toUpperCase().replace(/-/g, '_');
+}
+
+function widgetNameWithoutSuffix(widgetName) {
+  // manage-massive-campaigns-widget → manage-massive-campaigns
+  return widgetName.replace(/-widget$/, '');
+}
+
+function widgetPascalWithoutSuffix(widgetName) {
+  // manage-massive-campaigns-widget → ManageMassiveCampaigns
+  return widgetNameToPascal(widgetNameWithoutSuffix(widgetName));
+}
+
+/**
+ * Detecta el widget project dentro de projects/
+ * Retorna { widgetDir, libDir, widgetName } o null
+ */
+function detectWidgetProject() {
+  const projectsDir = path.join(projectPath, 'projects');
+  if (!fs.existsSync(projectsDir)) return null;
+  const entries = fs.readdirSync(projectsDir, { withFileTypes: true })
+    .filter(d => d.isDirectory());
+  if (entries.length === 0) return null;
+  const widgetDir = path.join(projectsDir, entries[0].name);
+  const libDir    = path.join(widgetDir, 'src', 'lib');
+  return {
+    widgetDir,
+    libDir,
+    widgetName: entries[0].name,  // e.g. "manage-massive-campaigns-widget"
+  };
+}
+
+/**
+ * Lee el configuration.ts existente y extrae:
+ * - Los driven adapters (gateways + services + sus imports)
+ * - Las interfaces de endpoints y operationIds
+ * - Los use cases
+ * - El interceptor si existe
+ * - El DEFAULT_CONFIGURATION con endpoints y operationIds
+ */
+function parseOldConfiguration(libDir) {
+  const configFile = path.join(libDir, 'manage-massive-campaigns-widget.configuration.ts');
+  // Buscar el archivo de configuración (puede tener nombre diferente)
+  const candidates = fs.readdirSync(libDir).filter(f =>
+    f.endsWith('.configuration.ts') || f.endsWith('.module.ts')
+  );
+  const configPath = candidates.length > 0
+    ? path.join(libDir, candidates[0])
+    : null;
+
+  if (!configPath || !fs.existsSync(configPath)) return null;
+  return fs.readFileSync(configPath, 'utf-8');
+}
+
+/**
+ * Detecta los servicios driven adapters del proyecto.
+ * Para cada service.ts encuentra: gateway, service, endpoints config, operationIds config
+ */
+function detectDrivenAdapters(libDir) {
+  const infraDir = [
+    path.join(libDir, 'infraestructure', 'driven-adapter'),
+    path.join(libDir, 'infrastructure', 'driven-adapter'),
+    path.join(libDir, 'infrastructure', 'driven-adapters'),
+    path.join(libDir, 'infraestructure', 'driven-adapters'),
+  ].find(d => fs.existsSync(d));
+
+  if (!infraDir) return [];
+
+  const adapters = [];
+  const serviceDirs = fs.readdirSync(infraDir, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => path.join(infraDir, d.name));
+
+  for (const svcDir of serviceDirs) {
+    const files = fs.readdirSync(svcDir);
+    const serviceFile = files.find(f => f.endsWith('.service.ts') && !f.endsWith('.spec.ts'));
+    if (!serviceFile) continue;
+
+    const serviceContent = fs.readFileSync(path.join(svcDir, serviceFile), 'utf-8');
+
+    // Detectar @Identifier('ServiceName')
+    const identifierMatch = serviceContent.match(/@Identifier\s*\(\s*['"](\w+)['"]\s*\)/);
+    const serviceName = identifierMatch ? identifierMatch[1] : path.basename(svcDir);
+
+    // Detectar el Gateway que extiende
+    const gatewayMatch = serviceContent.match(/extends\s+(\w+Gateway)/);
+    const gatewayName = gatewayMatch ? gatewayMatch[1] : null;
+
+    // Detectar la clase del servicio
+    const classMatch = serviceContent.match(/export\s+class\s+(\w+Service)/);
+    const className = classMatch ? classMatch[1] : null;
+
+    // Detectar si tiene configuration
+    const configFile = files.find(f => f.endsWith('.service.configuration.ts'));
+
+    // Detectar endpoints y operationIds del DEFAULT_CONFIGURATION original
+    adapters.push({ serviceName, gatewayName, className, svcDir, configFile });
+  }
+
+  return adapters;
+}
+
+/**
+ * Genera el archivo .token.ts tipado con las interfaces del .config.ts.
+ * widgets/src/lib/<widget-name>.token.ts
+ */
+function genWidgetToken(widgetName, pascal) {
+  const endpointsIface  = `I${pascal}ConfigurationEndpoints`;
+  const operationIface  = `I${pascal}OperationIdsConfig`;
+
+  return `import { InjectionToken } from "@angular/core";
+import { ${endpointsIface}, ${operationIface} } from "./${widgetName}.config";
+
+export const ENDPOINTS_CONFIG = new InjectionToken<${endpointsIface}>('Endpoints for widget.');
+export const OPERATION_IDS_CONFIG = new InjectionToken<${operationIface}>('Operation Ids for widget.');
+`;
+}
+
+/**
+ * Genera el componente raíz standalone del widget.
+ * <widget-name>.ts
+ */
+function genWidgetComponent(widgetName, pascal) {
+  const baseName = widgetNameWithoutSuffix(widgetName); // manage-massive-campaigns
+  const selector = `bc-${baseName}`;                    // bc-manage-massive-campaigns
+
+  return `import { Component } from '@angular/core';
+import { RouterOutlet } from '@angular/router';
+
+@Component({
+    selector: '${selector}',
+    template: \`
+        <div>
+            <router-outlet></router-outlet>
+        </div>
+        \`,
+    standalone: true,
+    imports: [RouterOutlet]
+})
+export class ${pascal} { }
+`;
+}
+
+/**
+ * Genera el archivo .routes.ts moviéndolo desde ui/pages/<widget>-routes.constants.ts
+ * y actualizando los imports relativos.
+ */
+function genWidgetRoutes(widgetName, libDir) {
+  const screaming = widgetNameToScreamingSnake(widgetName);
+  const exportName = `${screaming}_ROUTES`;
+
+  // Buscar el archivo de routes actual
+  const candidates = [
+    ...getAllFiles(path.join(libDir, 'ui', 'pages'), '.ts'),
+  ].filter(f => f.includes('routes') || f.includes('ROUTES'));
+
+  let routesContent = null;
+  let oldRoutesFile = null;
+
+  for (const f of candidates) {
+    const c = fs.readFileSync(f, 'utf-8');
+    if (c.includes('Routes') && c.includes('component:')) {
+      routesContent = c;
+      oldRoutesFile = f;
+      break;
+    }
+  }
+
+  if (!routesContent) {
+    // Generar placeholder
+    return {
+      content: `import { Routes } from '@angular/router';\n\nexport const ${exportName}: Routes = [\n    // TODO: agregar rutas\n];\n`,
+      oldFile: null,
+    };
+  }
+
+  // Actualizar paths relativos: de ui/pages/ a src/lib/
+  let updated = routesContent;
+
+  // Los imports de componentes eran relativos a ui/pages/
+  // Ahora el archivo está en src/lib/ — necesita subir a ui/pages/
+  updated = updated.replace(
+    /from\s*['"]\.\/([^'"]+)['"]/g,
+    (_, rel) => `from './ui/pages/${rel}'`
+  );
+
+  // Asegurar que el export use el nombre correcto
+  // Reemplazar cualquier export const ... ROUTES → el nombre correcto
+  updated = updated.replace(
+    /export\s+const\s+\w+_ROUTES\s*:/,
+    `export const ${exportName}:`
+  );
+
+  return { content: updated, oldFile: oldRoutesFile };
+}
+
+/**
+ * Genera el .config.ts completo leyendo el .configuration.ts existente.
+ * Extrae todo lo que puede y genera el nuevo formato standalone.
+ */
+function genWidgetConfig(widgetName, libDir, adapters) {
+  const pascal    = widgetPascalWithoutSuffix(widgetName); // ManageMassiveCampaigns
+  const screaming = widgetNameToScreamingSnake(widgetNameWithoutSuffix(widgetName));
+  const fullPascal = widgetNameToPascal(widgetName); // ManageMassiveCampaignsWidget
+
+  const endpointsIface = `I${pascal}ConfigurationEndpoints`;
+  const operationIface = `I${pascal}OperationIdsConfig`;
+  const modelIface     = `I${pascal}ConfigurationModel`;
+  const importFnName   = `importProvidersFrom${fullPascal}`;
+
+  // Leer el configuration original para extraer endpoints y operationIds
+  const oldConfig = parseOldConfiguration(libDir);
+
+  // Extraer el bloque DEFAULT_CONFIGURATION completo del archivo original
+  let defaultConfigBlock = '{}';
+  if (oldConfig) {
+    const dcMatch = oldConfig.match(/export\s+const\s+DEFAULT_CONFIGURATION[\s\S]*?=\s*(\{[\s\S]*?\});\s*\n\s*(?:const|export)/);
+    if (dcMatch) defaultConfigBlock = dcMatch[1];
+  }
+
+  // Extraer interceptor si existe
+  const interceptorMatch = oldConfig ? oldConfig.match(/import\s*\{([^}]*Interceptor[^}]*)\}\s*from\s*['"]([^'"]+)['"]/) : null;
+  const interceptorImport  = interceptorMatch ? `import { ${interceptorMatch[1].trim()} } from "${interceptorMatch[2]}";` : '';
+  const interceptorName    = interceptorMatch ? interceptorMatch[1].trim() : null;
+
+  // Construir imports de driven adapters
+  const daImports = adapters.map(a => {
+    if (!a.className || !a.svcDir) return '';
+    const relPath = path.relative(libDir, path.join(a.svcDir, a.className.charAt(0).toLowerCase() + a.className.slice(1).replace('Service','') + '.service')).replace(/\\/g, '/');
+    const relGateway = a.gatewayName
+      ? path.relative(libDir, path.join(a.svcDir, '..', '..', 'domain', 'models',
+          a.serviceName.charAt(0).toLowerCase() + a.serviceName.slice(1),
+          'gateway', a.serviceName.charAt(0).toLowerCase() + a.serviceName.slice(1) + '.gateway'
+        )).replace(/\\/g, '/')
+      : null;
+    return [
+      a.gatewayName ? `import { ${a.gatewayName} } from './${relGateway}';` : null,
+      a.className   ? `import { ${a.className} } from './${relPath}';` : null,
+    ].filter(Boolean).join('\n');
+  }).filter(Boolean).join('\n');
+
+  // Generar los campos de las interfaces de endpoints y operationIds desde los adapters
+  const endpointsFields = adapters
+    .filter(a => a.serviceName)
+    .map(a => {
+      const configType = a.configFile
+        ? `${a.serviceName}EndpointsConfig`
+        : 'Record<string, string>';
+      return `    ${a.serviceName}: ${configType};`;
+    }).join('\n');
+
+  const operationFields = adapters
+    .filter(a => a.serviceName)
+    .map(a => {
+      const configType = a.configFile
+        ? `${a.serviceName}OperationIdsConfig`
+        : 'Record<string, string>';
+      return `    ${a.serviceName}?: ${configType};`;
+    }).join('\n');
+
+  // Imports de los tipos de configuración de cada servicio
+  const serviceConfigImports = adapters
+    .filter(a => a.configFile && a.svcDir)
+    .map(a => {
+      const relPath = path.relative(libDir,
+        path.join(a.svcDir, a.configFile.replace('.ts', ''))
+      ).replace(/\\/g, '/');
+      return `import { ${a.serviceName}EndpointsConfig, ${a.serviceName}OperationIdsConfig } from './${relPath}';`;
+    }).join('\n');
+
+  // Gateways e implementaciones para infrastructures
+  const infrastructuresEntries = adapters
+    .filter(a => a.gatewayName && a.className)
+    .map(a => `        {\n            provide: ${a.gatewayName},\n            useClass: ${a.className},\n        },`)
+    .join('\n');
+
+  const interceptorProvider = interceptorName
+    ? `    { provide: HTTP_INTERCEPTORS, useClass: ${interceptorName}, multi: true },`
+    : '';
+  const interceptorHttpImport = interceptorName
+    ? `import { HTTP_INTERCEPTORS } from "@angular/common/http";\n` : '';
+
+  return `${interceptorHttpImport}${interceptorImport ? interceptorImport + '\n' : ''}${adapters.filter(a=>a.gatewayName).map(a=>`import { ${a.gatewayName} } from '${findGatewayRelPath(libDir, a)}';`).join('\n')}
+${adapters.filter(a=>a.className).map(a=>`import { ${a.className} } from '${findServiceRelPath(libDir, a)}';`).join('\n')}
+${serviceConfigImports}
+import { ClassProvider, EnvironmentProviders, Provider } from "@angular/core";
+import { ENDPOINTS_CONFIG, OPERATION_IDS_CONFIG } from "./${widgetName}.token";
+
+export interface ${endpointsIface} {
+${endpointsFields}
+}
+
+export interface ${operationIface} {
+${operationFields}
+}
+
+export interface ${modelIface} {
+    infrastructures?: ClassProvider[];
+    endpoints?: ${endpointsIface};
+    operationIds?: ${operationIface};
+}
+
+export const DEFAULT_CONFIGURATION: ${modelIface} = ${defaultConfigBlock ? defaultConfigBlock.replace(/\[\s*\{[\s\S]*?\}\s*\]\s*as\s+IInfrastructureMappingModel\[\]/s, `[\n${infrastructuresEntries}\n    ]`) : `{\n    infrastructures: [\n${infrastructuresEntries}\n    ],\n    endpoints: { /* TODO: endpoints */ },\n    operationIds: { /* TODO: operationIds */ },\n}`};
+
+export const FULL_PROVIDERS = [
+    ...DEFAULT_CONFIGURATION.infrastructures,
+    { provide: ENDPOINTS_CONFIG, useValue: DEFAULT_CONFIGURATION.endpoints },
+    { provide: OPERATION_IDS_CONFIG, useValue: DEFAULT_CONFIGURATION.operationIds },
+${interceptorProvider}
+];
+
+function getProvidersFromConfig(widgetConfig: ${modelIface}): Array<Provider | EnvironmentProviders> {
+    const configModel = {
+        ...DEFAULT_CONFIGURATION,
+        infrastructures: widgetConfig.infrastructures || DEFAULT_CONFIGURATION.infrastructures,
+        endpoints: widgetConfig.endpoints || DEFAULT_CONFIGURATION.endpoints,
+        operationIds: widgetConfig.operationIds || DEFAULT_CONFIGURATION.operationIds,
+    };
+    return [
+        ...configModel.infrastructures,
+        { provide: ENDPOINTS_CONFIG, useValue: configModel.endpoints },
+        { provide: OPERATION_IDS_CONFIG, useValue: configModel.operationIds },
+${interceptorProvider}
+    ];
+}
+
+export function ${importFnName}(widgetConfig: ${modelIface}): Array<Provider | EnvironmentProviders> {
+    return [...getProvidersFromConfig(widgetConfig)];
+}
+`;
+}
+
+// Helpers para paths relativos de gateways y services
+function findGatewayRelPath(libDir, adapter) {
+  if (!adapter.gatewayName) return './unknown';
+  // Buscar el archivo del gateway en el proyecto
+  const allTs = getAllFiles(libDir, '.ts');
+  const gatewayFile = allTs.find(f =>
+    f.includes('gateway') &&
+    fs.readFileSync(f,'utf-8').includes(`export abstract class ${adapter.gatewayName}`)
+  );
+  if (gatewayFile) {
+    return './' + path.relative(libDir, gatewayFile).replace(/\.ts$/, '').replace(/\\/g, '/');
+  }
+  return `./domain/models/${adapter.serviceName.toLowerCase()}/gateway/${adapter.serviceName.toLowerCase()}.gateway`;
+}
+
+function findServiceRelPath(libDir, adapter) {
+  if (!adapter.className) return './unknown';
+  const allTs = getAllFiles(libDir, '.ts');
+  const svcFile = allTs.find(f =>
+    f.endsWith('.service.ts') && !f.endsWith('.spec.ts') &&
+    fs.readFileSync(f,'utf-8').includes(`export class ${adapter.className}`)
+  );
+  if (svcFile) {
+    return './' + path.relative(libDir, svcFile).replace(/\.ts$/, '').replace(/\\/g, '/');
+  }
+  return `./infraestructure/driven-adapter/${adapter.serviceName.toLowerCase()}/${adapter.serviceName.toLowerCase()}.service`;
+}
+
+/**
+ * Actualiza public-api.ts: agrega los nuevos exports y quita los del módulo viejo.
+ */
+function updatePublicApi(publicApiPath, widgetName, pascal, fullPascal, screaming) {
+  if (!fs.existsSync(publicApiPath)) return null;
+  let content = fs.readFileSync(publicApiPath, 'utf-8');
+
+  // Quitar exports del módulo viejo y routes viejos
+  content = content.replace(/export\s*\{[^}]*Module[^}]*\}\s*from[^;]+;\n?/g, '');
+  content = content.replace(/export\s*\{[^}]*ROUTES[^}]*\}\s*from[^;]+;\n?/g, '');
+
+  // Preparar nuevas líneas al inicio
+  const newExports = [
+    `export { ${screaming}_ROUTES } from './lib/${widgetName}.routes';`,
+    `export * from './lib/${widgetName}.config';`,
+    ``,
+    `/** UI */`,
+    `export { ${fullPascal} } from './lib/${widgetName}';`,
+  ].join('\n');
+
+  // Insertar al inicio, conservar el resto
+  const uiSection = content.indexOf('/** UI */');
+  if (uiSection >= 0) {
+    content = newExports + '\n' + content.slice(uiSection).replace(/\/\*\* UI \*\/\n/, '');
+  } else {
+    content = newExports + '\n' + content;
+  }
+
+  return content;
+}
+
+async function generateWidgetStandaloneFiles() {
+  print(title('GENERAR ARCHIVOS STANDALONE DEL WIDGET'));
+  print(info('Genera: .token.ts, .ts (componente raíz), .routes.ts'));
+  print(info('Actualiza: public-api.ts\n'));
+
+  const widget = detectWidgetProject();
+  if (!widget) {
+    print(err('No se encontró la carpeta projects/ con un widget.')); return;
+  }
+
+  const { widgetName, libDir, widgetDir } = widget;
+  const pascal       = widgetPascalWithoutSuffix(widgetName);  // ManageMassiveCampaigns
+  const fullPascal   = widgetNameToPascal(widgetName);          // ManageMassiveCampaignsWidget
+  const screaming    = widgetNameToScreamingSnake(widgetName);  // MANAGE_MASSIVE_CAMPAIGNS_WIDGET
+  const screamingBase = widgetNameToScreamingSnake(widgetNameWithoutSuffix(widgetName));
+
+  print(info(`Widget detectado : ${widgetName}`));
+  print(info(`Clase raíz       : ${fullPascal}`));
+  print(info(`Export routes    : ${screaming}_ROUTES`));
+  print(info(`Función config   : importProvidersFrom${fullPascal}\n`));
+
+  const adapters = detectDrivenAdapters(libDir);
+  print(info(`Driven adapters detectados: ${adapters.length}`));
+  adapters.forEach(a => print(`    ${dim('·')} ${a.serviceName} (${a.className} ← ${a.gatewayName})`));
+  print('');
+
+  const dryRun = await prompt('  ¿Ejecutar en modo dry-run (solo muestra sin guardar)? (s/n): ');
+  const isDry  = dryRun.toLowerCase() === 's';
+
+  const confirm = await prompt(`  ¿${isDry ? 'Mostrar' : 'Generar'} archivos? (s/n): `);
+  if (confirm.toLowerCase() !== 's') { print(warn('Cancelado.')); return; }
+
+  // ── 1. .token.ts ──────────────────────────────────────────
+  const tokenPath    = path.join(libDir, `${widgetName}.token.ts`);
+  const tokenContent = genWidgetToken(widgetName, pascal);
+  print(step(`Generando ${widgetName}.token.ts`));
+  if (isDry) { print(dim(tokenContent)); } else {
+    fs.writeFileSync(tokenPath, tokenContent, 'utf-8');
+    print(ok(tokenPath));
+  }
+
+  // ── 2. Componente raíz .ts ────────────────────────────────
+  const compPath    = path.join(libDir, `${widgetName}.ts`);
+  const compContent = genWidgetComponent(widgetName, fullPascal);
+  print(step(`Generando ${widgetName}.ts`));
+  if (isDry) { print(dim(compContent)); } else {
+    fs.writeFileSync(compPath, compContent, 'utf-8');
+    print(ok(compPath));
+  }
+
+  // ── 3. .routes.ts ─────────────────────────────────────────
+  const routesPath    = path.join(libDir, `${widgetName}.routes.ts`);
+  const { content: routesContent, oldFile: oldRoutesFile } = genWidgetRoutes(widgetName, libDir);
+  print(step(`Generando ${widgetName}.routes.ts`));
+  if (isDry) { print(dim(routesContent)); } else {
+    fs.writeFileSync(routesPath, routesContent, 'utf-8');
+    print(ok(routesPath));
+    if (oldRoutesFile) {
+      print(info(`  Archivo original: ${path.relative(projectPath, oldRoutesFile)}`));
+      print(warn('  Recuerda eliminar el archivo de routes original si ya no se usa.'));
+    }
+  }
+
+  // ── 4. Actualizar public-api.ts ───────────────────────────
+  const publicApiPath = path.join(widgetDir, 'src', 'public-api.ts');
+  print(step('Actualizando public-api.ts'));
+  const newPublicApi = updatePublicApi(publicApiPath, widgetName, pascal, fullPascal, screamingBase);
+  if (newPublicApi) {
+    if (isDry) { print(dim(newPublicApi.substring(0, 400) + '\n...')); } else {
+      fs.writeFileSync(publicApiPath, newPublicApi, 'utf-8');
+      print(ok(publicApiPath));
+    }
+  } else {
+    print(warn('public-api.ts no encontrado — créalo manualmente.'));
+  }
+
+  // ── 5. Actualizar imports en driven-adapters: injection.constants → .token ─
+  print(step('Actualizando imports de injection.constants → .token en driven adapters'));
+  const allTs = getAllFiles(libDir, '.ts').filter(f => !f.endsWith('.spec.ts'));
+  let updatedImports = 0;
+  for (const f of allTs) {
+    const content = fs.readFileSync(f, 'utf-8');
+    if (!content.includes('injection.constants')) continue;
+    // Calcular ruta relativa al .token desde este archivo
+    const relToken = path.relative(path.dirname(f), path.join(libDir, `${widgetName}.token`))
+      .replace(/\\/g, '/');
+    const relTokenPath = relToken.startsWith('.') ? relToken : './' + relToken;
+    const updated = content.replace(
+      /from\s*['"][^'"]*injection\.constants['"]/g,
+      `from '${relTokenPath}'`
+    );
+    if (updated !== content) {
+      if (!isDry) fs.writeFileSync(f, updated, 'utf-8');
+      updatedImports++;
+      print(`    ${ok(`import actualizado: ${path.relative(projectPath, f)}`)}`);
+    }
+  }
+  if (updatedImports === 0) print(dim('    No se encontraron imports de injection.constants'));
+
+  separator();
+  print(ok(`Archivos ${isDry ? 'analizados' : 'generados'} exitosamente 🎉`));
+  if (!isDry) {
+    print(warn('\nPróximos pasos:'));
+    print(dim('  1. Ejecuta la opción 8 para eliminar core-utils (ahora que .token.ts existe)'));
+    print(dim('  2. Verifica los tipos en el .config.ts generado'));
+    print(dim('  3. Revisa public-api.ts y ajusta exports si es necesario'));
+    print(dim('  4. Elimina los archivos legacy: .configuration.ts, .module.ts, injection.constants.ts'));
+  }
+}
+
 // ─── STANDALONE MIGRATION ───────────────────────────────────
 async function migrateStandalone() {
   print(title('MIGRACIÓN A STANDALONE'));
@@ -2368,6 +2884,7 @@ async function showMenu(projectInfo) {
   print(`  ${C.cyan}9${C.reset}  Reestructura de carpetas (patrón registered-accounts)`);
   print(`  ${C.cyan}10${C.reset} Migrar Microfront (NgModule → standalone + Angular 20)`);
   print(`  ${C.cyan}11${C.reset} Convertir standalone: false → standalone: true`);
+  print(`  ${C.cyan}12${C.reset} Generar archivos standalone del widget (.token, .ts, .routes, public-api)`);
   print(`  ${C.red}0${C.reset}  Salir\n`);
 
   const choice = await prompt(`  → `);
@@ -2421,6 +2938,7 @@ async function main() {
         case '9': await restructureFolders(); break;
         case '10': await migrateMicrofrontend(); break;
         case '11': await convertStandaloneFlag(); break;
+        case '12': await generateWidgetStandaloneFiles(); break;
         case '7':
           const logFile = saveLog();
           print(ok(`Log guardado en: ${logFile}`));
@@ -2431,7 +2949,7 @@ async function main() {
           print('\nHasta pronto 👋\n');
           process.exit(0);
         default:
-          print(warn('Opción inválida. Elige entre 0 y 11.'));
+          print(warn('Opción inválida. Elige entre 0 y 12.'));
       }
 
       await prompt('\n  Presiona Enter para volver al menú...');
