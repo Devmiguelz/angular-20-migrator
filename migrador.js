@@ -1187,131 +1187,207 @@ function transformDrivenAdapter(content, symbols) {
   }
   let r = content;
 
-  // Quitar decorator @Identifier('...')
+  // ── 1. Detectar nombre del servicio desde @Identifier('ServiceName') ──────
+  const identifierMatch = r.match(/@Identifier\s*\(\s*['"]([^'"]+)['"]\s*\)/);
+  const serviceName = identifierMatch ? identifierMatch[1] : null;
+
+  // ── 2. Detectar variables inyectadas en el constructor ───────────────────
+  const endpointsVarMatch = r.match(/@Inject\(ENDPOINTS_CONFIG\)\s*private\s+(\w+)/);
+  const opsVarMatch       = r.match(/@Inject\(OPERATION_IDS_CONFIG\)\s*private\s+(\w+)/);
+  const httpVarMatch      = r.match(/public\s+(http(?:Client)?):\s*HttpClient/);
+  const endpointsVar      = endpointsVarMatch ? endpointsVarMatch[1] : 'endpoints';
+  const opsVar            = opsVarMatch       ? opsVarMatch[1]       : 'operationIdsConfig';
+  const httpVar           = httpVarMatch      ? httpVarMatch[1]      : 'http';
+
+  // ── 3. Extraer mapa OI_varname → OperationId entry ANTES de eliminarlas ──
+  // Patrón: private OI_XXX = { OperationId: this.opsVar[this.identifier][Entry.KEY] }
+  const oiMap = {}; // 'OI_GET_ALL' → 'CampaignsServiceOperationIdsEntries.GET_ALL_OPERATION_ID'
+  const oiRe = /private\s+OI_(\w+)\s*=\s*\{[^}]*OperationId\s*:\s*this\.\w+\[this\.identifier\]\[([^\]]+)\][^}]*\}/g;
+  let oiMatch;
+  while ((oiMatch = oiRe.exec(r)) !== null) {
+    oiMap['OI_' + oiMatch[1]] = oiMatch[2].trim();
+  }
+
+  // ── 4. Quitar @Identifier decorator ──────────────────────────────────────
   r = r.replace(/@Identifier\s*\(\s*['"][^'"]+['"]\s*\)\s*\n?/g, '');
 
-  // Quitar import de @Inject si viene solo de core-utils (se quitará con removeCoreUtilsImports)
-  // Quitar @Inject en parámetros del constructor → usar inject()
-  // Reemplazar el constructor completo que usa @Inject(ENDPOINTS_CONFIG) por inject()
-  // Patrón: constructor(public http: HttpClient, @Inject(X) private a: T, @Inject(Y) private b: T) { super(http); }
+  // ── 5. Reemplazar constructor completo por campos inject() ───────────────
   r = r.replace(
-    /constructor\s*\(\s*public\s+(http(?:Client)?):\s*HttpClient\s*,\s*@Inject\(ENDPOINTS_CONFIG\)\s*private\s+(\w+):\s*\w+\s*,\s*@Inject\(OPERATION_IDS_CONFIG\)\s*private\s+(\w+):\s*\w+\s*\)\s*\{\s*super\s*\([^)]*\)\s*;?\s*\}/g,
-    (_, httpName, endpointsName, opsName) =>
-      `private readonly ${httpName} = inject(HttpClient);\n  private readonly ${endpointsName} = inject(ENDPOINTS_CONFIG);\n  private readonly ${opsName} = inject(OPERATION_IDS_CONFIG);`
+    /constructor\s*\(\s*[\s\S]*?super\s*\([^)]*\)\s*;?\s*\}/gs,
+    [
+      `private readonly ${httpVar} = inject(HttpClient);`,
+      `  private readonly ${endpointsVar} = inject(ENDPOINTS_CONFIG);`,
+      `  private readonly ${opsVar} = inject(OPERATION_IDS_CONFIG);`,
+    ].join('\n')
   );
 
-  // Reemplazar acceso this.endpoints[this.identifier][Key] → this.endpoints.ServiceName[Key]
-  // No podemos saber el nombre del servicio sin más contexto, dejamos un TODO claro
-  r = r.replace(/this\.endpoints\[this\.identifier\]\[([^\]]+)\]/g, 'this.endpoints[$1]');
-  r = r.replace(/this\.operationIds(?:Config)?\[this\.identifier\]\[([^\]]+)\]/g, 'this.operationIds[$1]');
-  r = r.replace(/this\.operationIds\[this\.identifier\]\[([^\]]+)\]/g, 'this.operationIds[$1]');
+  // ── 6. Eliminar propiedades OI_* de clase ────────────────────────────────
+  r = r.replace(/\s*private\s+OI_\w+\s*=\s*\{[^}]*\};\s*/g, '\n');
 
-  // Reemplazar this.baseRequest<T>(path, HTTP_METHODS.GET, ...) → this.http.get<T>(path, { headers })
-  // Patrón general de baseRequest con HTTP_METHODS
-  r = r.replace(
-    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.GET,\s*(?:null|undefined),\s*\{\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
-    (_, T, path, headers) =>
-      `this.http.get<${T}>(${path.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
-  );
-  r = r.replace(
-    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.POST,\s*(?:null|undefined),\s*\{\s*body:\s*([^,}]+),?\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
-    (_, T, path, body, headers) =>
-      `this.http.post<${T}>(${path.trim()}, ${body.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
-  );
-  r = r.replace(
-    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*'PUT',\s*(?:null|undefined),\s*\{\s*body:\s*([^,}]+),?\s*headers:\s*([^}]+)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
-    (_, T, path, body, headers) =>
-      `this.http.put<${T}>(${path.trim()}, ${body.trim()}, { headers: new HttpHeaders(${headers.trim()}) })`
-  );
-  r = r.replace(
-    /this\.baseRequest<([^>]+)>\(\s*([^,]+),\s*HTTP_METHODS\.DELETE,\s*(?:null|undefined),\s*\{\s*headers:\s*([^,}]+),?\s*params:\s*(\{[^}]+\})\s*\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
-    (_, T, path, headers, params) =>
-      `this.http.delete<${T}>(${path.trim()}, { headers: new HttpHeaders(${headers.trim()}), params: ${params.trim()} })`
-  );
-  // Fallback: cualquier baseRequest que quede, marcarlo con TODO
-  r = r.replace(/this\.baseRequest</g, '/* TODO: reemplazar baseRequest */ this.http.request<');
-
-  // Quitar HTTP_METHODS que queden huérfanos (ya no se usan)
-  r = r.replace(/HTTP_METHODS\.\w+/g, m => {
-    const map = { 'HTTP_METHODS.GET':'\'GET\'','HTTP_METHODS.POST':'\'POST\'','HTTP_METHODS.PUT':'\'PUT\'','HTTP_METHODS.DELETE':'\'DELETE\'','HTTP_METHODS.PATCH':'\'PATCH\'' };
-    return map[m] || m;
-  });
-
-  // Agregar inject import si no existe
-  if (!/inject\s*,/.test(r) && !/, inject/.test(r) && /inject\(/.test(r)) {
+  // ── 7. Reemplazar acceso a endpoints/operationIds con serviceName ─────────
+  if (serviceName) {
     r = r.replace(
-      /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/core['"]/,
-      (_, inner) => `import { ${inner.trim()}, inject } from '@angular/core'`
+      new RegExp('this\\.' + endpointsVar + '\\[this\\.identifier\\]\\[([^\\]]+)\\]', 'g'),
+      `this.${endpointsVar}.${serviceName}[$1]`
     );
-  }
-  // Agregar HttpHeaders si no existe y se necesita
-  if (/HttpHeaders/.test(r) && !/HttpHeaders/.test(r.split('from')[0])) {
     r = r.replace(
-      /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/common\/http['"]/,
-      (_, inner) => {
-        const parts = inner.split(',').map(s=>s.trim());
-        if (!parts.includes('HttpHeaders')) parts.push('HttpHeaders');
-        return `import { ${parts.join(', ')} } from '@angular/common/http'`;
+      new RegExp('this\\.' + opsVar + '\\[this\\.identifier\\]\\[([^\\]]+)\\]', 'g'),
+      `this.${opsVar}.${serviceName}[$1]`
+    );
+    r = r.replace(/this\.operationIds(?:Config)?\[this\.identifier\]\[([^\]]+)\]/g,
+      `this.${opsVar}.${serviceName}[$1]`);
+    // Acceso directo a endpoints sin identifier (después de ya haber resuelto)
+    r = r.replace(
+      new RegExp('this\\.' + endpointsVar + '\\[([A-Z][A-Za-z]+Entries\\.[A-Z_]+)\\]', 'g'),
+      `this.${endpointsVar}.${serviceName}[$1]`
+    );
+  } else {
+    r = r.replace(/this\.endpoints\[this\.identifier\]\[([^\]]+)\]/g, `this.${endpointsVar}[$1]`);
+    r = r.replace(/this\.operationIds(?:Config)?\[this\.identifier\]\[([^\]]+)\]/g, `this.${opsVar}[$1]`);
+  }
+
+  // ── 8. Reemplazar baseRequest → HttpClient methods ───────────────────────
+  // El patrón del archivo REAL:
+  // const path = this.endpoints.X[Entry.GET_ALL];
+  // return this.baseRequest<T>(path, HTTP_METHODS.GET, null, { headers: this.OI_GET_ALL }, null, true);
+  //
+  // Objetivo:
+  // const headers = new HttpHeaders().set('OperationId', this.operationIdsConfig.X.GET_ALL_OPERATION_ID);
+  // const path = this.endpoints.X.GET_ALL;
+  // return this.http.get<T>(path, { headers });
+
+  const METHOD_MAP = {
+    'HTTP_METHODS.GET': 'get', 'HTTP_METHODS.POST': 'post',
+    'HTTP_METHODS.PUT': 'put', 'HTTP_METHODS.DELETE': 'delete', 'HTTP_METHODS.PATCH': 'patch',
+    "'GET'": 'get', "'POST'": 'post', "'PUT'": 'put', "'DELETE'": 'delete', "'PATCH'": 'patch',
+    '"GET"': 'get', '"POST"': 'post', '"PUT"': 'put', '"DELETE"': 'delete', '"PATCH"': 'patch',
+  };
+
+  // Regex que captura baseRequest con opts en una línea o multilinea
+  const baseReqRe = /this\.baseRequest<([^>]+)>\(\s*([\s\S]+?),\s*(HTTP_METHODS\.\w+|'[A-Z]+'|"[A-Z]+"),\s*(?:null|undefined),\s*\{([\s\S]*?)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g;
+
+  // Reemplazar baseRequest con contexto completo (incluyendo "return" anterior)
+  // Patrón: return this.baseRequest<T>(path, METHOD, null, {opts}, null, true);
+  // Con posible "const path = ..." antes
+  r = r.replace(
+    /return\s+this\.baseRequest<([^>]+)>\(\s*([\s\S]+?),\s*(HTTP_METHODS\.\w+|'[A-Z]+'|"[A-Z]+"),\s*(?:null|undefined),\s*\{([\s\S]*?)\}\s*,\s*(?:null|undefined),\s*true\s*\)/g,
+    (match, T, pathExpr, methodRaw, opts) => {
+      const method   = METHOD_MAP[methodRaw.trim()] || 'request';
+      const path_    = pathExpr.trim();
+
+      const bodyMatch    = opts.match(/\bbody\s*:\s*([^,\n}]+)/);
+      const headersMatch = opts.match(/headers\s*:\s*(this\.OI_\w+|\{[^}]+\})/);
+      const paramsMatch  = opts.match(/params\s*:\s*(\{[\s\S]+?\})/);
+
+      const rawHeaders = headersMatch ? headersMatch[1].trim() : null;
+      const params     = paramsMatch  ? paramsMatch[1].trim()  : null;
+      const body       = bodyMatch    ? bodyMatch[1].trim()     : null;
+
+      // Resolver headersExpr
+      let headersExpr = '';
+      if (rawHeaders) {
+        if (rawHeaders.startsWith('this.OI_')) {
+          const oiKey  = rawHeaders.replace('this.', '');
+          const entry  = oiMap[oiKey];
+          if (entry && serviceName) {
+            const entryVal = entry.includes('.') ? entry.split('.').pop() : entry;
+            headersExpr = `new HttpHeaders().set('OperationId', this.${opsVar}.${serviceName}.${entryVal})`;
+          } else if (entry) {
+            headersExpr = `new HttpHeaders().set('OperationId', this.${opsVar}[${entry}])`;
+          } else {
+            headersExpr = `new HttpHeaders()/* TODO: OperationId para ${oiKey} */`;
+          }
+        } else if (rawHeaders.startsWith('{')) {
+          headersExpr = `new HttpHeaders(${rawHeaders})`;
+        } else {
+          headersExpr = rawHeaders;
+        }
       }
-    );
-  }
 
-  return r;
-}
+      const optsArr = [
+        headersExpr ? 'headers'            : null,
+        params      ? `params: ${params}`  : null,
+      ].filter(Boolean);
 
-/**
- * Transforma la configuration.ts que usa IWidgetConfigurationModel e IInfrastructureMappingModel.
- * Reemplaza la interface extendida por una local con la misma forma.
- * El bucle for..of para construir infrastructures[] se reemplaza por un map() directo.
- */
-function transformConfiguration(content, symbols) {
-  if (!symbols.has('IWidgetConfigurationModel') && !symbols.has('IInfrastructureMappingModel')) {
-    return content;
-  }
-  let r = content;
+      const headersLine  = headersExpr ? `const headers = ${headersExpr};\n        ` : '';
 
-  // Reemplazar "extends IWidgetConfigurationModel" por la interface local inline
-  r = r.replace(/\bextends\s+IWidgetConfigurationModel\b/g, '');
-
-  // Quitar "as IInfrastructureMappingModel[]" cast
-  r = r.replace(/\s*as\s+IInfrastructureMappingModel\[\]/g, '');
-
-  // Reemplazar el bloque for..of que construye infrastructures por un .map() limpio
-  r = r.replace(
-    /const infrastructures\s*=\s*\[\s*\];\s*for\s*\(const item of DEFAULT_CONFIGURATION\.infrastructures[^)]*\)\s*\{[\s\S]*?infrastructures\.push\(\{[\s\S]*?provide:\s*item\.gateway,\s*useClass:\s*item\.implementation[\s\S]*?\}\s*\);\s*\}/g,
-    `const infrastructures = (DEFAULT_CONFIGURATION.infrastructures || []).map(item => ({\n  provide: item.gateway,\n  useClass: item.implementation,\n}));`
+      if (method === 'get' || method === 'delete') {
+        const callOpts = optsArr.length ? `, { ${optsArr.join(', ')} }` : '';
+        return `${headersLine}return this.${httpVar}.${method}<${T}>(${path_}${callOpts})`;
+      } else {
+        const bodyVal  = body || 'body';
+        const callOpts = optsArr.length ? `, { ${optsArr.join(', ')} }` : '';
+        return `${headersLine}return this.${httpVar}.${method}<${T}>(${path_}, ${bodyVal}${callOpts})`;
+      }
+    }
   );
 
-  // Reemplazar IWidgetConfigurationModel en el tipo de la interface extendida
-  // Si la interface local del proyecto extiende IWidgetConfigurationModel, la dejamos como standalone
-  r = r.replace(/\bIWidgetConfigurationModel\b/g, 'ICoreWidgetConfig');
-  r = r.replace(/\bIInfrastructureMappingModel\b/g, '{ gateway: any; implementation: any }');
+  // Fallback: baseRequest residual
+  r = r.replace(/this\.baseRequest</g, `/* TODO: reemplazar baseRequest */ this.${httpVar}.request<`);
 
-  // Agregar la interface local al inicio del archivo (después de los imports)
-  const localInterface = `\n// ─── Interface local (reemplaza IWidgetConfigurationModel de core-utils) ───\nexport interface ICoreWidgetConfig {\n  infrastructures?: { gateway: any; implementation: any }[];\n  endpoints?: Record<string, Record<string, string>>;\n  operationIds?: Record<string, Record<string, string>>;\n  labels?: Record<string, unknown>;\n}\n`;
-  const lastImportIdx = r.lastIndexOf('\nimport ');
-  const afterLastImport = r.indexOf('\n', lastImportIdx + 1);
-  if (lastImportIdx >= 0 && afterLastImport >= 0) {
-    r = r.slice(0, afterLastImport + 1) + localInterface + r.slice(afterLastImport + 1);
+  // ── 9. Limpiar HTTP_METHODS residuales ───────────────────────────────────
+  r = r.replace(/HTTP_METHODS\.(\w+)/g, (_, m) => `'${m}'`);
+
+  // ── 10. Actualizar import de @angular/core: añadir inject ────────────────
+  if (/inject\(/.test(r)) {
+    const coreRe  = /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/core['"]/;
+    const coreM   = r.match(coreRe);
+    if (coreM) {
+      const parts = coreM[1].split(',').map(s => s.trim()).filter(Boolean);
+      if (!parts.includes('inject')) {
+        // Poner inject delante, quitar Inject (con mayúscula, que era para @Inject)
+        const filtered = parts.filter(p => p !== 'Inject');
+        if (!filtered.includes('inject')) filtered.unshift('inject');
+        r = r.replace(coreRe, `import { ${filtered.join(', ')} } from '@angular/core'`);
+      }
+    } else {
+      r = `import { inject, Injectable } from '@angular/core';\n` + r;
+    }
   }
+
+  // ── 11. Actualizar import de @angular/common/http: añadir HttpHeaders ────
+  if (/HttpHeaders/.test(r)) {
+    const httpRe = /import\s*\{([^}]+)\}\s*from\s*['"]@angular\/common\/http['"]/;
+    const httpM  = r.match(httpRe);
+    if (httpM) {
+      const parts = httpM[1].split(',').map(s => s.trim()).filter(Boolean);
+      if (!parts.includes('HttpHeaders')) {
+        parts.push('HttpHeaders');
+        r = r.replace(httpRe, `import { ${parts.join(', ')} } from '@angular/common/http'`);
+      }
+    } else {
+      r = `import { HttpClient, HttpHeaders } from '@angular/common/http';\n` + r;
+    }
+  }
+
+  // ── 12. Agregar import de @angular/core si @Injectable() no tiene import ──
+  if (/@Injectable\(\)/.test(r) && !/from\s*['"]@angular\/core['"]/.test(r)) {
+    r = `import { Injectable } from '@angular/core';\n` + r;
+  }
+
+  // ── 13. Limpiar líneas vacías múltiples ──────────────────────────────────
+  r = r.replace(/\n{3,}/g, '\n\n');
 
   return r;
 }
 
-/**
- * Transforma un usecase que implementa IBaseUsecase<T>.
- * Antes: export class XUseCase implements IBaseUsecase<T> { ... }
- * Después: export class XUseCase { ... }  (TypeScript infiere la forma)
- */
+
 function transformUsecase(content, symbols) {
   if (!symbols.has('IBaseUsecase')) return content;
-  return content.replace(/\s*implements\s+IBaseUsecase<[^>]+>/g, '');
+  let r = content;
+
+  // Eliminar implements IBaseUsecase<T>
+  r = r.replace(/\s*implements\s+IBaseUsecase<[^>]+>/g, '');
+
+  // Si @Injectable() existe pero no hay import de @angular/core, agregarlo
+  if (/@Injectable\(\)/.test(r) && !/from\s*['"]@angular\/core['"]/.test(r)) {
+    r = `import { Injectable } from '@angular/core';\n` + r;
+  }
+
+  return r;
 }
 
-/**
- * Transforma un mapper que implementa IBaseMapper<T>.
- * Reemplaza la interface importada por una local.
- */
+
 function transformMapper(content, symbols) {
   if (!symbols.has('IBaseMapper')) return content;
   let r = content;
@@ -1320,6 +1396,43 @@ function transformMapper(content, symbols) {
   // Agregar interface local
   const localIface = `\nexport interface IMapper<T> { fromMap(response: { meta: unknown; data: T }): T; }\n`;
   r = localIface + r;
+  return r;
+}
+
+
+/**
+ * Transforma la configuration.ts que usa IWidgetConfigurationModel e IInfrastructureMappingModel.
+ */
+function transformConfiguration(content, symbols) {
+  if (!symbols.has('IWidgetConfigurationModel') && !symbols.has('IInfrastructureMappingModel')) {
+    return content;
+  }
+  let r = content;
+
+  // Eliminar "extends IWidgetConfigurationModel"
+  r = r.replace(/\bextends\s+IWidgetConfigurationModel\b/g, '');
+
+  // Quitar "as IInfrastructureMappingModel[]"
+  r = r.replace(/\s*as\s+IInfrastructureMappingModel\[\]/g, '');
+
+  // Reemplazar for-of que construye infrastructures[] por .map()
+  r = r.replace(
+    /const infrastructures\s*=\s*\[\s*\];\s*for\s*\(const item of DEFAULT_CONFIGURATION\.infrastructures[^)]*\)\s*\{[\s\S]*?infrastructures\.push\(\{[\s\S]*?provide:\s*item\.gateway,\s*useClass:\s*item\.implementation[\s\S]*?\}\s*\);\s*\}/g,
+    `const infrastructures = (DEFAULT_CONFIGURATION.infrastructures || []).map(item => ({\n  provide: item.gateway,\n  useClass: item.implementation,\n}));`
+  );
+
+  // Reemplazar los nombres de las interfaces
+  r = r.replace(/\bIWidgetConfigurationModel\b/g, 'ICoreWidgetConfig');
+  r = r.replace(/\bIInfrastructureMappingModel\b/g, '{ gateway: any; implementation: any }');
+
+  // Inyectar interface local después del último import
+  const localInterface = `\n// ─── Interface local (reemplaza IWidgetConfigurationModel de core-utils) ───\nexport interface ICoreWidgetConfig {\n  infrastructures?: { gateway: any; implementation: any }[];\n  endpoints?: Record<string, Record<string, string>>;\n  operationIds?: Record<string, Record<string, string>>;\n  labels?: Record<string, unknown>;\n}\n`;
+  const lastImportIdx = r.lastIndexOf('\nimport ');
+  const afterLastImport = r.indexOf('\n', lastImportIdx + 1);
+  if (lastImportIdx >= 0 && afterLastImport >= 0) {
+    r = r.slice(0, afterLastImport + 1) + localInterface + r.slice(afterLastImport + 1);
+  }
+
   return r;
 }
 
